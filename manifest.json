@@ -1,0 +1,60 @@
+{
+  "name": "llm",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "permissions": [
+    "net",
+    "kv"
+  ],
+  "depends": {},
+  "conflicts": [],
+  "commands": [],
+  "regex": [],
+  "events": [],
+  "buttons": [],
+  "cron": [],
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/ui/*",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/api/meta",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/api/config",
+      "auth": "admin"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/config",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/api/test",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/api/upstream-models",
+      "auth": "admin"
+    }
+  ],
+  "hasMiddleware": false,
+  "services": [
+    "llm"
+  ],
+  "durableObjects": [],
+  "displayName": "LLM 接口",
+  "description": "统一管理大模型供应商与模型别名，向其他插件提供 llm 服务（含工具调用透传）；不含聊天逻辑",
+  "ui": {
+    "path": "/ui/",
+    "title": "LLM 接口",
+    "icon": "sparkles"
+  }
+}

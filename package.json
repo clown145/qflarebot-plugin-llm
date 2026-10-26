@@ -1,0 +1,27 @@
+{
+  "name": "qflarebot-plugin-llm",
+  "version": "0.1.0",
+  "description": "QFlareBot 的大模型接口插件：统一管理供应商与模型别名，向其他插件导出 llm 服务（含工具调用透传）",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "qflarebot-plugin"
+  ],
+  "exports": "./src/index.ts",
+  "scripts": {
+    "build:page": "node scripts/build-page.mjs",
+    "build": "npm run build:page && qqbot-plugin build",
+    "sync": "npm run build && node -e \"require('node:fs').copyFileSync('dist/manifest.json','manifest.json')\"",
+    "test": "vitest run",
+    "preview": "node scripts/preview.mjs",
+    "typecheck": "tsc --noEmit && tsc -p web/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250917.0",
+    "@qqbot/plugin-cli": "file:../QFlareBot/packages/plugin-cli",
+    "@qqbot/sdk": "file:../QFlareBot/packages/sdk",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

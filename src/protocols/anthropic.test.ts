@@ -1,0 +1,147 @@
+import { describe, expect, it } from 'vitest'
+import { anthropic } from './anthropic.js'
+import type { ParsedStreamEvent, Target } from './types.js'
+
+const target: Target = {
+  provider: {
+    id: 'a',
+    name: 'A',
+    protocol: 'anthropic',
+    base_url: 'https://api.test/v1',
+    api_key: 'sk-ant',
+    enabled: true,
+  },
+  model: { alias: 'chat', provider: 'a', model: 'claude', enabled: true },
+}
+
+function bodyOf(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  })
+}
+
+async function events(chunks: string[]): Promise<ParsedStreamEvent[]> {
+  const out: ParsedStreamEvent[] = []
+  for await (const event of anthropic.parseStream(bodyOf(chunks))) out.push(event)
+  return out
+}
+
+describe('anthropic.buildChat', () => {
+  it('system 抽到顶层，连续同角色合并，max_tokens 有默认值', () => {
+    const built = anthropic.buildChat(target, {
+      messages: [
+        { role: 'system', content: '规则一' },
+        { role: 'system', content: '规则二' },
+        { role: 'user', content: 'a' },
+        { role: 'user', content: 'b' },
+      ],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect((built.init.headers as Record<string, string>)['x-api-key']).toBe('sk-ant')
+    expect((built.init.headers as Record<string, string>)['anthropic-version']).toBe('2023-06-01')
+    expect(body.system).toBe('规则一\n\n规则二')
+    expect(body.max_tokens).toBe(1024)
+    expect(body.messages).toHaveLength(1)
+    expect(body.messages[0].content).toEqual([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }])
+  })
+
+  it('工具定义、tool_use 与 tool_result 的映射', () => {
+    const built = anthropic.buildChat(target, {
+      messages: [
+        { role: 'user', content: '查一下' },
+        {
+          role: 'assistant',
+          content: '好的',
+          tool_calls: [{ id: 'c1', name: 'lookup', arguments: '{"q":"x"}' }],
+        },
+        { role: 'tool', tool_call_id: 'c1', content: '结果' },
+      ],
+      tools: [{ name: 'lookup', description: '查', parameters: { type: 'object', properties: {} } }],
+      tool_choice: 'required',
+    }, true)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.stream).toBe(true)
+    expect(body.tools[0]).toEqual({
+      name: 'lookup',
+      description: '查',
+      input_schema: { type: 'object', properties: {} },
+    })
+    expect(body.tool_choice).toEqual({ type: 'any' })
+    expect(body.messages[1]).toEqual({
+      role: 'assistant',
+      content: [
+        { type: 'text', text: '好的' },
+        { type: 'tool_use', id: 'c1', name: 'lookup', input: { q: 'x' } },
+      ],
+    })
+    expect(body.messages[2]).toEqual({
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'c1', content: '结果' }],
+    })
+  })
+
+  it('工具参数不是 JSON 对象时报 bad_request', () => {
+    expect(() =>
+      anthropic.buildChat(target, {
+        messages: [
+          { role: 'user', content: 'x' },
+          { role: 'assistant', tool_calls: [{ id: 'c', name: 't', arguments: 'not-json' }] },
+        ],
+      }, false),
+    ).toThrow(/bad_request|JSON/)
+  })
+})
+
+describe('anthropic.parseResponse', () => {
+  it('文本块拼接、tool_use 归一化', () => {
+    const parsed = anthropic.parseResponse({
+      content: [
+        { type: 'text', text: '你' },
+        { type: 'text', text: '好' },
+        { type: 'tool_use', id: 'c1', name: 'lookup', input: { q: 'x' } },
+      ],
+      stop_reason: 'tool_use',
+      usage: { input_tokens: 2, output_tokens: 3 },
+    })
+    expect(parsed.text).toBe('你好')
+    expect(parsed.toolCalls?.[0]).toEqual({ id: 'c1', name: 'lookup', arguments: '{"q":"x"}' })
+    expect(parsed.finishReason).toBe('tool_calls')
+    expect(parsed.usage).toEqual({ input_tokens: 2, output_tokens: 3, total_tokens: 5 })
+  })
+})
+
+describe('anthropic.parseStream', () => {
+  it('解析 message_start / content_block / message_delta / stop', async () => {
+    const out = await events([
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"lookup"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"x\\"}"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"好"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ])
+    expect(out.filter((item) => item.type === 'tool_call_delta')).toEqual([
+      { type: 'tool_call_delta', index: 0, id: 'c1', name: 'lookup' },
+      { type: 'tool_call_delta', index: 0, argumentsDelta: '{"q":' },
+      { type: 'tool_call_delta', index: 0, argumentsDelta: '"x"}' },
+    ])
+    expect(out.filter((item) => item.type === 'text_delta')).toEqual([{ type: 'text_delta', text: '好' }])
+    expect(out.some((item) => item.type === 'finish' && item.reason === 'tool_calls')).toBe(true)
+    expect(out.some((item) => item.type === 'usage')).toBe(true)
+  })
+
+  it('上游 error 事件会抛错', async () => {
+    await expect(events(['event: error\ndata: {"type":"error","error":{"message":"boom"}}\n\n'])).rejects.toThrow(/boom/)
+  })
+})
+
+describe('anthropic.parseListModels', () => {
+  it('读 data[].id', () => {
+    expect(anthropic.parseListModels({ data: [{ id: 'a' }, { id: 'b' }] })).toEqual(['a', 'b'])
+  })
+})
