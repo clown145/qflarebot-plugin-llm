@@ -119,3 +119,116 @@ describe('openai.parseListModels', () => {
     expect(openai.parseListModels(['d'])).toEqual(['d'])
   })
 })
+
+describe('openai 流内错误与推理内容', () => {
+  it('HTTP 200 流里的 error 事件会抛 LLMError，而不是被静默丢弃', async () => {
+    // OpenRouter / 中转 / vLLM 常在 200 的 SSE 里下发配额或鉴权错误
+    const error = await events([
+      'data: {"error":{"message":"quota exceeded","type":"insufficient_quota"}}\n\n',
+      'data: [DONE]\n\n',
+    ]).catch((err: unknown) => err)
+    expect(error).toMatchObject({ code: 'rate_limit' })
+    expect(String((error as Error).message)).toContain('quota exceeded')
+  })
+
+  it('鉴权类流内错误映射成 auth', async () => {
+    const error = await events([
+      'data: {"error":{"message":"invalid api key","type":"invalid_api_key"}}\n\n',
+    ]).catch((err: unknown) => err)
+    expect(error).toMatchObject({ code: 'auth' })
+  })
+
+  it('流内错误的 message 会被脱敏', async () => {
+    const body = bodyOf([
+      'data: {"error":{"message":"bad key sk-SECRET12345678","type":"invalid_api_key"}}\n\n',
+    ])
+    const error = await (async () => {
+      for await (const _event of openai.parseStream(body, { apiKey: 'sk-SECRET12345678' })) void _event
+    })().catch((err: unknown) => err)
+    expect(String((error as Error).message)).not.toContain('sk-SECRET12345678')
+  })
+
+  it('reasoning_content 解析进 parsed.reasoning', () => {
+    const parsed = openai.parseResponse({
+      choices: [{ message: { content: '答案', reasoning_content: '先想一下' }, finish_reason: 'stop' }],
+    })
+    expect(parsed.reasoning).toBe('先想一下')
+    expect(parsed.text).toBe('答案')
+  })
+
+  it('delta 里的 reasoning_content 产出 reasoning_delta', async () => {
+    const out = await events([
+      'data: {"choices":[{"delta":{"reasoning_content":"嗯"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"好"}}]}\n\n',
+    ])
+    expect(out.filter((item) => item.type === 'reasoning_delta')).toEqual([{ type: 'reasoning_delta', text: '嗯' }])
+  })
+
+  it('兼容网关用 reasoning 字段时同样识别', () => {
+    expect(openai.parseResponse({ choices: [{ message: { content: 'a', reasoning: 'r' } }] }).reasoning).toBe('r')
+  })
+})
+
+describe('openai 工具调用 id 唯一性', () => {
+  it('两条没有 id 的调用会得到不同的兜底 id', () => {
+    const parsed = openai.parseResponse({
+      choices: [{
+        message: {
+          content: '',
+          tool_calls: [
+            { function: { name: 'a', arguments: '{}' } },
+            { function: { name: 'b', arguments: '{}' } },
+          ],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    })
+    const ids = parsed.toolCalls?.map((call) => call.id) ?? []
+    expect(ids).toHaveLength(2)
+    expect(new Set(ids).size).toBe(2)
+  })
+})
+
+describe('openai 多模态内容', () => {
+  it('图片片段转成 image_url', () => {
+    const built = openai.buildChat(target, {
+      messages: [{ role: 'user', content: [{ type: 'image', url: 'https://x.test/a.png', detail: 'low' }] }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content).toEqual([
+      { type: 'image_url', image_url: { url: 'https://x.test/a.png', detail: 'low' } },
+    ])
+  })
+
+  it('data + media_type 拼成 data URI', () => {
+    const built = openai.buildChat(target, {
+      messages: [{ role: 'user', content: [{ type: 'image', data: 'AAAA', media_type: 'image/png' }] }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content[0].image_url.url).toBe('data:image/png;base64,AAAA')
+  })
+
+  it('音频片段转成 input_audio', () => {
+    const built = openai.buildChat(target, {
+      messages: [{ role: 'user', content: [{ type: 'audio', data: 'AAAA', format: 'wav' }] }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content).toEqual([{ type: 'input_audio', input_audio: { data: 'AAAA', format: 'wav' } }])
+  })
+
+  it('file 片段抛 unsupported（OpenAI 兼容协议不支持）', () => {
+    expect(() =>
+      openai.buildChat(target, {
+        messages: [{ role: 'user', content: [{ type: 'file', url: 'https://x.test/a.pdf' }] }],
+      }, false),
+    ).toThrow(/unsupported|不支持/)
+  })
+
+  it('单个 text 片段直接压成字符串', () => {
+    const built = openai.buildChat(target, {
+      messages: [{ role: 'user', content: [{ type: 'text', text: '只有文本' }] }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content).toBe('只有文本')
+  })
+})

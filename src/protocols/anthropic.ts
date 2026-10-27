@@ -1,21 +1,38 @@
-import type { ChatMessage, ChatRequest, ToolCall, ToolChoice } from '../contract.js'
+import type { ChatMessage, ChatRequest, LLMErrorCode, MessageContent, ToolCall, ToolChoice } from '../contract.js'
 import type { ProviderConfig } from '../config/types.js'
 import { LLMError } from '../errors.js'
 import { asArray, asNumber, asString, isRecord } from '../json.js'
 import { readSSE } from '../sse.js'
-import type { BuiltRequest, ParsedResponse, ParsedStreamEvent, ProtocolAdapter, Target } from './types.js'
+import { streamError, type UpstreamContext } from '../upstream.js'
+import type { BuiltRequest, ParsedResponse, ParsedStreamEvent, ProtocolAdapter, StreamContext, Target } from './types.js'
 import {
   anthropicFinish,
   anthropicUsage,
   endpointUrl,
   modelsUrl,
+  partUrl,
+  textOf,
+  toParts,
 } from './shared.js'
 
 const VERSION = '2023-06-01'
 
+/** 未传 max_tokens 时的兜底值：Anthropic 必填，太小会静默截断长回答 */
+const DEFAULT_MAX_TOKENS = 4096
+
 interface TextBlock {
   type: 'text'
   text: string
+}
+
+interface ImageBlock {
+  type: 'image'
+  source: Record<string, unknown>
+}
+
+interface DocumentBlock {
+  type: 'document'
+  source: Record<string, unknown>
 }
 
 interface ToolUseBlock {
@@ -28,11 +45,11 @@ interface ToolUseBlock {
 interface ToolResultBlock {
   type: 'tool_result'
   tool_use_id: string
-  content: string
+  content: string | Array<Record<string, unknown>>
   is_error?: boolean
 }
 
-type Block = TextBlock | ToolUseBlock | ToolResultBlock
+type Block = TextBlock | ImageBlock | DocumentBlock | ToolUseBlock | ToolResultBlock
 
 interface WireMessage {
   role: 'user' | 'assistant'
@@ -51,6 +68,31 @@ function toolInput(argumentsText: string): Record<string, unknown> {
   return value
 }
 
+/** base64 source（`data` + `media_type`）或 url source；两者都没有时抛 bad_request */
+function mediaSource(part: { url?: string; data?: string; media_type?: string }, where: string): Record<string, unknown> {
+  if (part.data) {
+    return {
+      type: 'base64',
+      media_type: part.media_type ?? 'application/octet-stream',
+      data: part.data,
+    }
+  }
+  if (part.url) return { type: 'url', url: part.url }
+  throw new LLMError('bad_request', `${where} 缺少 url 或 data`)
+}
+
+/** 把契约里的内容片段转成 Anthropic block；audio 明确不支持 */
+function contentBlocks(content: MessageContent | undefined, where: string): Block[] {
+  if (content === undefined) return []
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : []
+  return toParts(content).map((part) => {
+    if (part.type === 'text') return { type: 'text', text: part.text }
+    if (part.type === 'image') return { type: 'image', source: mediaSource(part, `${where} 的图片片段`) }
+    if (part.type === 'file') return { type: 'document', source: mediaSource(part, `${where} 的文件片段`) }
+    throw new LLMError('unsupported', 'Anthropic 协议不支持音频输入')
+  })
+}
+
 function mapMessages(messages: ChatMessage[]): { system: string; messages: WireMessage[] } {
   const system: string[] = []
   const out: WireMessage[] = []
@@ -62,42 +104,63 @@ function mapMessages(messages: ChatMessage[]): { system: string; messages: WireM
     else out.push({ role, content: blocks })
   }
 
-  for (const message of messages) {
+  messages.forEach((message, index) => {
+    const where = `messages[${index}]`
     if (message.role === 'system') {
-      if (message.content?.trim()) system.push(message.content.trim())
-      continue
+      // system 只接受纯文本；这里取 text 片段，图片等非文本片段在 system 里没有意义
+      const text = textOf(message.content).trim()
+      if (text) system.push(text)
+      return
     }
     if (message.role === 'user') {
-      push('user', [{ type: 'text', text: message.content ?? '' }])
-      continue
+      push('user', contentBlocks(message.content, where))
+      return
     }
     if (message.role === 'assistant') {
       const blocks: Block[] = []
-      if (message.content) blocks.push({ type: 'text', text: message.content })
+      // reasoning 不回传：Anthropic 的 thinking block 带签名，重建会校验失败
+      blocks.push(...contentBlocks(message.content, where))
       for (const call of message.tool_calls ?? []) {
         blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: toolInput(call.arguments) })
       }
       if (blocks.length === 0) throw new LLMError('bad_request', 'assistant 消息既没有内容也没有工具调用')
       push('assistant', blocks)
-      continue
+      return
     }
     if (!message.tool_call_id) throw new LLMError('bad_request', 'tool 消息缺少 tool_call_id')
     push('user', [{
       type: 'tool_result',
       tool_use_id: message.tool_call_id,
-      content: message.content ?? '',
+      content: textOf(message.content),
       ...(message.is_error ? { is_error: true } : {}),
     }])
-  }
+  })
 
   return { system: system.join('\n\n'), messages: out }
 }
 
-function mapToolChoice(choice: ToolChoice): unknown {
+/**
+ * Anthropic 的 tool_choice 只有 `auto` / `any` / `tool`，没有 `none`。
+ * 调用方要求禁用工具时，直接不发送 tools 字段（返回 undefined）。
+ */
+function mapToolChoice(choice: ToolChoice): unknown | undefined {
+  if (choice === 'none') return undefined
   if (choice === 'auto') return { type: 'auto' }
-  if (choice === 'none') return { type: 'none' }
   if (choice === 'required') return { type: 'any' }
   return { type: 'tool', name: choice.name }
+}
+
+/**
+ * 用户自定义头。受管头一律丢掉：保存时 validateConfig 已把它们拦成 error，
+ * 但 KV 里可能还有历史遗留配置，而 `Headers` 对大小写不同的同名键会合并成坏值。
+ */
+const MANAGED_HEADERS = new Set(['authorization', 'proxy-authorization', 'x-api-key', 'api-key', 'host', 'content-length', 'content-type'])
+
+function applyHeaders(headers: Record<string, string>, custom: Record<string, string> | undefined): void {
+  for (const [key, value] of Object.entries(custom ?? {})) {
+    if (MANAGED_HEADERS.has(key.toLowerCase())) continue
+    headers[key] = value
+  }
 }
 
 function buildChat(target: Target, request: ChatRequest, stream: boolean): BuiltRequest {
@@ -106,14 +169,16 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
     accept: stream ? 'text/event-stream' : 'application/json',
     'anthropic-version': VERSION,
   }
-  for (const [key, value] of Object.entries(target.provider.headers ?? {})) headers[key] = value
+  applyHeaders(headers, target.provider.headers)
   if (target.provider.api_key) headers['x-api-key'] = target.provider.api_key
 
   const mapped = mapMessages(request.messages)
+  // max_tokens 必填：请求值 → 模型配置的输出上限 → 兜底 4096（旧实现的 1024 会静默截断长回答）
+  const maxTokens = request.max_tokens ?? target.model.max_output_tokens ?? DEFAULT_MAX_TOKENS
   const body: Record<string, unknown> = {
     ...(request.extra_body ?? {}),
     model: target.model.model,
-    max_tokens: request.max_tokens ?? 1024,
+    max_tokens: maxTokens,
     messages: mapped.messages,
   }
   if (mapped.system) body['system'] = mapped.system
@@ -122,13 +187,16 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
   if (request.stop !== undefined) {
     body['stop_sequences'] = Array.isArray(request.stop) ? request.stop : [request.stop]
   }
-  if (request.tools?.length) {
-    body['tools'] = request.tools.map((tool) => ({
+  // tool_choice: 'none' 表示调用方不要工具 → 连 tools 都不发（Anthropic 没有 none 类型）
+  const toolChoice = request.tool_choice ? mapToolChoice(request.tool_choice) : undefined
+  const sendTools = Boolean(request.tools?.length) && request.tool_choice !== 'none'
+  if (sendTools) {
+    body['tools'] = request.tools!.map((tool) => ({
       name: tool.name,
       ...(tool.description ? { description: tool.description } : {}),
       input_schema: tool.parameters,
     }))
-    if (request.tool_choice) body['tool_choice'] = mapToolChoice(request.tool_choice)
+    if (toolChoice !== undefined) body['tool_choice'] = toolChoice
   }
   if (stream) body['stream'] = true
 
@@ -142,11 +210,15 @@ function parseResponse(json: unknown): ParsedResponse {
   if (!isRecord(json)) throw new Error('上游返回的不是 JSON 对象')
   const content = asArray(json['content'])
   let text = ''
+  let reasoning = ''
   const toolCalls: ToolCall[] = []
   for (const block of content) {
     if (!isRecord(block)) continue
     if (block['type'] === 'text') {
       text += asString(block['text'])
+    } else if (block['type'] === 'thinking') {
+      // 扩展思考：只取正文，签名不回传（回传会校验失败）
+      reasoning += asString(block['thinking'])
     } else if (block['type'] === 'tool_use') {
       const name = asString(block['name'])
       if (!name) continue
@@ -161,13 +233,41 @@ function parseResponse(json: unknown): ParsedResponse {
   const usage = anthropicUsage(json['usage'])
   return {
     text,
+    ...(reasoning ? { reasoning } : {}),
     ...(toolCalls.length ? { toolCalls } : {}),
     ...(finishReason ? { finishReason } : {}),
     ...(usage ? { usage } : {}),
   }
 }
 
-async function* parseStream(body: ReadableStream<Uint8Array>): AsyncGenerator<ParsedStreamEvent> {
+function streamErrorCode(type: string | undefined): LLMErrorCode {
+  switch (type) {
+    case 'authentication_error':
+    case 'permission_error':
+      return 'auth'
+    case 'rate_limit_error':
+      return 'rate_limit'
+    case 'invalid_request_error':
+    case 'not_found_error':
+    case 'request_too_large':
+      return 'bad_request'
+    case 'overloaded_error':
+    case 'api_error':
+      return 'upstream'
+    default:
+      return 'upstream'
+  }
+}
+
+function upstreamOf(ctx: StreamContext | undefined): UpstreamContext {
+  return { provider: '', alias: '', timeoutMs: 0, ...(ctx?.apiKey ? { apiKey: ctx.apiKey } : {}) }
+}
+
+async function* parseStream(
+  body: ReadableStream<Uint8Array>,
+  ctx?: StreamContext,
+): AsyncGenerator<ParsedStreamEvent> {
+  const upstream = upstreamOf(ctx)
   for await (const message of readSSE(body)) {
     let json: unknown
     try {
@@ -202,6 +302,9 @@ async function* parseStream(body: ReadableStream<Uint8Array>): AsyncGenerator<Pa
       if (delta['type'] === 'text_delta') {
         const text = asString(delta['text'])
         if (text) yield { type: 'text_delta', text }
+      } else if (delta['type'] === 'thinking_delta') {
+        const thinking = asString(delta['thinking'])
+        if (thinking) yield { type: 'reasoning_delta', text: thinking }
       } else if (delta['type'] === 'input_json_delta') {
         const partial = asString(delta['partial_json'])
         if (partial) yield { type: 'tool_call_delta', index, argumentsDelta: partial }
@@ -221,7 +324,8 @@ async function* parseStream(body: ReadableStream<Uint8Array>): AsyncGenerator<Pa
     if (event === 'message_stop') return
     if (event === 'error') {
       const error = isRecord(json['error']) ? json['error'] : {}
-      throw new Error(asString(error['message']) || '上游流式返回错误')
+      // 走统一的流内错误映射：message 必须脱敏，上游常把 key 原样回显在里面
+      throw streamError(error, upstream)
     }
   }
 }
@@ -231,7 +335,7 @@ function buildListModels(provider: ProviderConfig): BuiltRequest {
     accept: 'application/json',
     'anthropic-version': VERSION,
   }
-  for (const [key, value] of Object.entries(provider.headers ?? {})) headers[key] = value
+  applyHeaders(headers, provider.headers)
   if (provider.api_key) headers['x-api-key'] = provider.api_key
   return { url: modelsUrl(provider.base_url), init: { method: 'GET', headers } }
 }

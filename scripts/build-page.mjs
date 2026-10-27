@@ -19,7 +19,10 @@ const result = await build({
   platform: 'browser',
   target: 'es2022',
   external: ['/bridge.js'],
-  minify: false,
+  // 产物要提交且 CI 用 git diff 校验：必须固定 absWorkingDir，否则 esbuild 的
+  // `// web/api.ts` 这类注释会随 process.cwd() 变化，同一份源码在不同目录跑出不同字节。
+  absWorkingDir: root,
+  minify: true,
   legalComments: 'none',
   logLevel: 'silent',
 })
@@ -32,10 +35,16 @@ const [html, css] = await Promise.all([
   readFile(path.join(root, 'web/style.css'), 'utf8'),
 ])
 
-const safeJs = js.replace(/<\/script/gi, '<\\/script')
+// `</script` 会提前结束内联脚本；`<!--` 在 HTML 解析里也有特殊含义，一并转义
+const safeJs = js.replace(/<\/script/gi, '<\\/script').replace(/<!--/g, '<\\!--')
+
+/**
+ * 用函数式 replace：字符串形式的替换值里 `$&`、`$1`、`$\`` 有特殊含义，
+ * CSS/JS 里出现这些序列会把整段 HTML 插进来。函数返回值不做任何替换解释。
+ */
 const page = html
-  .replace('<!--STYLE-->', `<style>\n${css}\n</style>`)
-  .replace('<!--SCRIPT-->', `<script type="module">\n${safeJs}\n</script>`)
+  .replace('<!--STYLE-->', () => `<style>\n${css}\n</style>`)
+  .replace('<!--SCRIPT-->', () => `<script type="module">\n${safeJs}\n</script>`)
 
 const out = `// 由 scripts/build-page.mjs 生成，不要手改。\nexport const PAGE_HTML = ${JSON.stringify(page)}\n`
 await writeFile(path.join(root, 'src/page.generated.ts'), out)

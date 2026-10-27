@@ -1,13 +1,20 @@
 {
   "name": "qflarebot-plugin-llm",
   "version": "0.1.0",
-  "description": "QFlareBot 的大模型接口插件：统一管理供应商与模型别名，向其他插件导出 llm 服务（含工具调用透传）",
+  "description": "QFlareBot 的大模型接口插件：统一管理供应商与模型别名，向其他插件导出 llm 服务（含工具调用与多模态透传）",
   "license": "MIT",
   "type": "module",
   "keywords": [
     "qflarebot-plugin"
   ],
   "exports": "./src/index.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clown145/qflarebot-plugin-llm.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build:page": "node scripts/build-page.mjs",
     "build": "npm run build:page && qqbot-plugin build",
@@ -21,6 +28,7 @@
     "@qqbot/plugin-cli": "file:../QFlareBot/packages/plugin-cli",
     "@qqbot/sdk": "file:../QFlareBot/packages/sdk",
     "esbuild": "^0.28.0",
+    "jsdom": "^30.1.3",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
   }

@@ -19,9 +19,11 @@ import { mergeUsage } from './protocols/shared.js'
 import { adapterFor } from './protocols/registry.js'
 import type { BuiltRequest, ParsedResponse, ProtocolAdapter } from './protocols/types.js'
 import { validateChatRequest } from './request.js'
-import type { ConfigStore, LoadedConfig } from './store.js'
+import { CONFIG_READ_FAILED, type ConfigStore, type LoadedConfig } from './store.js'
 import { fetchJson, openStream, type TransportOptions } from './transport.js'
 import { fetchError, type UpstreamContext } from './upstream.js'
+
+const streamEncoder = new TextEncoder()
 
 export interface LLMOptions {
   store: ConfigStore
@@ -55,7 +57,10 @@ export class LLM implements LLMService {
 
   async listModels(): Promise<ModelInfo[]> {
     const loaded = await this.load()
-    return loaded.corrupt ? [] : listConfiguredModels(loaded.config)
+    if (loaded.readFailed) throw new LLMError('config', CONFIG_READ_FAILED)
+    // 配置损坏时和 chat/resolve 保持一致：抛 config，而不是让调用方以为「没有模型」
+    if (loaded.corrupt) throw new LLMError('config', '配置损坏；请打开面板的「LLM 接口」页面重新保存')
+    return listConfiguredModels(loaded.config)
   }
 
   async resolve(alias?: string): Promise<ResolvedModel> {
@@ -88,7 +93,7 @@ export class LLM implements LLMService {
       throw error
     }
 
-    if (!parsed.text && !parsed.toolCalls?.length && !parsed.finishReason) {
+    if (!parsed.text && !parsed.toolCalls?.length && !parsed.reasoning && !parsed.finishReason) {
       const error = new LLMError('bad_response', '上游没有返回内容', {
         provider: prepared.provider.id,
         alias: prepared.model.alias,
@@ -128,17 +133,44 @@ export class LLM implements LLMService {
     }
 
     let text = ''
+    let reasoning = ''
     const calls: (ToolCall | undefined)[] = []
     let usage: Usage | undefined
     let finishReason: FinishReason | undefined
+    let streamedBytes = 0
+
+    const count = (value: string | undefined): void => {
+      if (!value) return
+      streamedBytes += streamEncoder.encode(value).byteLength
+      if (streamedBytes > LIMITS.stream_max_bytes) {
+        throw new LLMError('bad_response', `上游流式内容超过 ${LIMITS.stream_max_bytes / 1024 / 1024} MB 上限`, {
+          provider: prepared.provider.id,
+          alias: prepared.model.alias,
+        })
+      }
+    }
 
     try {
-      for await (const event of prepared.adapter.parseStream(body)) {
+      // 把 api_key 传给适配器：流内 error 事件的 message 需要脱敏
+      for await (const event of prepared.adapter.parseStream(body, { apiKey: prepared.provider.api_key })) {
         if (event.type === 'text_delta') {
+          count(event.text)
           text += event.text
           yield { type: 'text_delta', text: event.text }
+        } else if (event.type === 'reasoning_delta') {
+          count(event.text)
+          reasoning += event.text
+          yield { type: 'reasoning_delta', text: event.text }
         } else if (event.type === 'tool_call_delta') {
-          if (event.index < 0 || event.index > 63) continue
+          if (event.index < 0 || event.index > 63) {
+            throw new LLMError('bad_response', `工具调用索引 ${event.index} 超出支持范围（0–63）`, {
+              provider: prepared.provider.id,
+              alias: prepared.model.alias,
+            })
+          }
+          count(event.id)
+          count(event.name)
+          count(event.argumentsDelta)
           const current = calls[event.index] ?? { id: '', name: '', arguments: '' }
           if (event.id) current.id = event.id
           if (event.name) current.name = event.name
@@ -158,16 +190,25 @@ export class LLM implements LLMService {
         }
       }
     } catch (err) {
-      const error =
-        err instanceof LLMError
+      let error: LLMError
+      if (err instanceof LLMError) {
+        error = err.provider && err.alias
           ? err
-          : isAbortError(err)
-            ? fetchError(err, this.upstreamContext(prepared), handle.timedOut(), handle.parentAborted())
-            : new LLMError('bad_response', `读取上游流失败：${errorMessage(err)}`, {
-                provider: prepared.provider.id,
-                alias: prepared.model.alias,
-                cause: err,
-              })
+          : new LLMError(err.code, err.message, {
+              provider: err.provider ?? prepared.provider.id,
+              alias: err.alias ?? prepared.model.alias,
+              ...(err.status !== undefined ? { status: err.status } : {}),
+              ...(err.detail ? { detail: err.detail } : {}),
+            })
+      } else if (isAbortError(err)) {
+        error = fetchError(err, this.upstreamContext(prepared), handle.timedOut(), handle.parentAborted())
+      } else {
+        error = new LLMError('bad_response', `读取上游流失败：${errorMessage(err)}`, {
+          provider: prepared.provider.id,
+          alias: prepared.model.alias,
+          cause: err,
+        })
+      }
       this.logError('llm.stream', prepared, startedAt, error)
       throw error
     } finally {
@@ -180,7 +221,7 @@ export class LLM implements LLMService {
       if (!call?.name) return []
       return [{ id: call.id || `call_${index}`, name: call.name, arguments: call.arguments || '{}' }]
     })
-    if (!text && !toolCalls.length && !finishReason) {
+    if (!text && !toolCalls.length && !reasoning && !finishReason) {
       const error = new LLMError('bad_response', '上游没有返回内容', {
         provider: prepared.provider.id,
         alias: prepared.model.alias,
@@ -193,6 +234,7 @@ export class LLM implements LLMService {
       prepared,
       {
         text,
+        ...(reasoning ? { reasoning } : {}),
         ...(toolCalls.length ? { toolCalls } : {}),
         ...(finishReason ? { finishReason } : {}),
         ...(usage ? { usage } : {}),
@@ -213,11 +255,13 @@ export class LLM implements LLMService {
       } else if (!alias) {
         alias = config.default_model
       }
-      if (!alias) return { ok: false, latency_ms: 0, provider: providerId, error: '没有可测试的模型别名' }
+      if (!alias) return { ok: false, latency_ms: 0, ...(providerId ? { provider: providerId } : {}), error: '没有可测试的模型别名' }
 
       const target = resolveTarget(config, alias)
       providerId = target.provider.id
-      const timeout = Math.min(target.provider.timeout_ms ?? config.request_timeout_ms, 20000)
+      const configured = target.provider.timeout_ms ?? config.request_timeout_ms
+      // 健康检查只需要极小的一次往返；上限再收一档，别让它吃掉事件预算
+      const timeout = Math.min(configured, 10000)
       const result = await this.chat({
         model: alias,
         messages: [{ role: 'user', content: 'ping' }],
@@ -239,7 +283,8 @@ export class LLM implements LLMService {
         ok: false,
         latency_ms: 0,
         ...(alias ? { alias } : {}),
-        provider: providerId,
+        // 只有解析出供应商时才带上；早期错误（配置读失败）没有供应商
+        ...(providerId ? { provider: providerId } : {}),
         error: errorMessage(err),
       }
     }
@@ -252,6 +297,7 @@ export class LLM implements LLMService {
 
   private async requireConfig(): Promise<StoredConfig> {
     const loaded = await this.load()
+    if (loaded.readFailed) throw new LLMError('config', CONFIG_READ_FAILED)
     if (loaded.corrupt) {
       throw new LLMError('config', '配置损坏；请打开面板的「LLM 接口」页面重新保存')
     }
@@ -278,7 +324,11 @@ export class LLM implements LLMService {
     }
 
     const configured = request.timeout_ms ?? target.provider.timeout_ms ?? config.request_timeout_ms
-    const timeoutMs = Math.min(Math.max(Number.isFinite(configured) ? configured : 25000, LIMITS.timeout_min), LIMITS.timeout_max)
+    // 单次调用压到 call_timeout_max：一次事件所有插件合计 30 秒，28 秒会把预算吃光
+    const timeoutMs = Math.min(
+      Math.max(Number.isFinite(configured) ? configured : 15000, LIMITS.timeout_min),
+      LIMITS.call_timeout_max,
+    )
     const retries = Number.isFinite(config.max_retries) ? config.max_retries : 1
     const maxRetries = Math.min(Math.max(Math.trunc(retries), 0), LIMITS.max_retries)
 
@@ -341,6 +391,7 @@ export class LLM implements LLMService {
     const finish = parsed.finishReason ?? (toolCalls ? 'tool_calls' : undefined)
     return {
       text: parsed.text,
+      ...(parsed.reasoning ? { reasoning: parsed.reasoning } : {}),
       ...(toolCalls ? { tool_calls: toolCalls } : {}),
       ...(finish ? { finish_reason: finish } : {}),
       alias: prepared.model.alias,

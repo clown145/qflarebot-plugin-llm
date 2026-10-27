@@ -59,8 +59,23 @@ export function clear(node: Element): void {
   while (node.firstChild) node.removeChild(node.firstChild)
 }
 
+/** field() 自动生成的 id 计数器；只在页面生命周期内递增，不参与持久化 */
+let fieldIdSeed = 0
+
+/**
+ * 表单字段：label 与 control 用 for/id 关联，点标签也能聚焦控件、读屏能念出字段名。
+ * 自动生成 id；control 已有 id 时直接复用，不覆盖。
+ */
 export function field(label: string, control: HTMLElement, desc?: string): HTMLElement {
-  return h('div', { class: 'field' }, h('label', { text: label }), control, desc ? h('span', { class: 'desc', text: desc }) : null)
+  fieldIdSeed += 1
+  if (!control.id) control.id = `field-${fieldIdSeed}`
+  return h(
+    'div',
+    { class: 'field' },
+    h('label', { text: label, attrs: { for: control.id } }),
+    control,
+    desc ? h('span', { class: 'desc', text: desc }) : null,
+  )
 }
 
 export function badge(text: string, kind: 'ok' | 'warn' | 'err' | '' = ''): HTMLElement {
@@ -71,6 +86,13 @@ export function formatTime(iso: string): string {
   if (!iso) return '—'
   const date = new Date(iso)
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false })
+}
+
+export function formatTokenCount(value?: number): string {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return '—'
+  if (value >= 1_000_000) return `${Math.round((value / 1_000_000) * 10) / 10}M`
+  if (value >= 1_000) return `${Math.round(value / 1_000)}K`
+  return String(value)
 }
 
 export async function copyText(text: string): Promise<boolean> {

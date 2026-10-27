@@ -51,10 +51,9 @@
   ],
   "durableObjects": [],
   "displayName": "LLM 接口",
-  "description": "统一管理大模型供应商与模型别名，向其他插件提供 llm 服务（含工具调用透传）；不含聊天逻辑",
+  "description": "统一管理大模型供应商与模型别名，向其他插件提供 llm 服务（含工具调用与多模态透传）；不含聊天逻辑",
   "ui": {
     "path": "/ui/",
-    "title": "LLM 接口",
-    "icon": "sparkles"
+    "title": "LLM 接口"
   }
 }

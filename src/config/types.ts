@@ -22,8 +22,15 @@ export interface ModelConfig {
   alias: string
   provider: string
   model: string
+  /** 默认请求输出上限；和模型自身上限 max_output_tokens 不是一回事 */
   max_tokens?: number
   temperature?: number
+  /** 输入上下文上限（tokens） */
+  context_window?: number
+  /** 模型输出上限（tokens） */
+  max_output_tokens?: number
+  /** 模型能力；不填时按协议给默认值 */
+  capabilities?: Capability[]
   enabled: boolean
 }
 
@@ -87,17 +94,34 @@ export interface ProtocolMeta {
 
 export const LIMITS = {
   timeout_min: 1000,
+  /** 配置里能填的超时上限（向后兼容，老配置里 25000/28000 仍然合法） */
   timeout_max: 28000,
+  /**
+   * 单次调用实际允许的上限。一次 QQ 事件里**所有插件合计**只有 30 秒（平台硬限），
+   * 框架 25 秒就告警；28 秒会直接把事件预算吃光，调用方在工具循环里连第二次都调不了。
+   * 所以配置允许填到 28000，但真正发请求时压到这个值，剩下的留给调用方收尾。
+   */
+  call_timeout_max: 20000,
   max_retries: 2,
   max_tokens_max: 131072,
+  /** 请求体上限（按字节算，不是字符数） */
   body_max_bytes: 256 * 1024,
+  /** 非流式响应体上限；LLM 的非流式响应极少超过 2 MB，再大基本是上游故障 */
+  response_max_bytes: 2 * 1024 * 1024,
+  /** 流式累计文本 / 工具参数上限 */
+  stream_max_bytes: 8 * 1024 * 1024,
+  /** 管理页拉上游模型列表的上限 */
+  models_response_max_bytes: 2 * 1024 * 1024,
 } as const
 
 export const CAPABILITIES: Record<ProtocolId, Capability[]> = {
-  openai: ['tools', 'json'],
-  anthropic: ['tools'],
+  openai: ['text', 'tools', 'json'],
+  anthropic: ['text', 'tools'],
 }
 
+/** 面板和校验共用；顺序也是面板上的显示顺序 */
+export const CAPABILITY_VALUES: Capability[] = ['text', 'image', 'audio', 'tools', 'json', 'reasoning']
+
 export function capabilitiesOf(protocol: ProtocolId): Capability[] {
-  return CAPABILITIES[protocol] ?? []
+  return CAPABILITIES[protocol] ?? ['text']
 }

@@ -1,52 +1,56 @@
-import { ApiError, api, resizePage, setPageTitle, toast } from './api.js'
+import { api, resizePage, setPageTitle, toast } from './api.js'
 import { confirmDialog } from './dialogs.js'
 import { clear, download, h } from './dom.js'
-import { applySaved, emit, isDirty, setBusy, setLoaded, setMeta, state, subscribe } from './state.js'
-import type { Tab } from './types.js'
-import { normalizeDraft, toExport, toInput } from './types.js'
-import { renderModels } from './views/models.js'
+import { clearPending, hasPendingEdits } from './pending.js'
+import { configureSaving, updateConfig } from './save.js'
+import { setLoaded, setMeta, state, subscribe } from './state.js'
+import type { AppConfigDraft, Tab } from './types.js'
+import { clone, normalizeDraft, reconcileKeyState, toExport } from './types.js'
 import { renderOverview } from './views/overview.js'
-import { renderProviders } from './views/providers.js'
-import { renderSettings } from './views/settings.js'
+import { renderService, resetServiceState } from './views/service.js'
+import { renderSettings, resetSettingsDraft } from './views/settings.js'
 import { renderUsage } from './views/usage.js'
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'overview', label: '概览' },
-  { id: 'providers', label: '供应商' },
-  { id: 'models', label: '模型' },
+  { id: 'service', label: '模型服务' },
   { id: 'settings', label: '设置' },
   { id: 'usage', label: '用法' },
 ]
 
 function goTab(tab: Tab): void {
   state.activeTab = tab
+  try {
+    const url = new URL(location.href)
+    url.searchParams.set('tab', tab)
+    history.replaceState(null, '', url.toString())
+  } catch {
+    // 沙箱里不允许改地址时忽略，页面内切换仍然有效
+  }
   render()
 }
 
 function updateHeader(): void {
-  const dirty = isDirty()
+  const pending = hasPendingEdits()
   const dirtyEl = document.getElementById('dirty')
   if (dirtyEl) {
-    dirtyEl.textContent = dirty ? '未保存' : '已保存'
-    dirtyEl.className = `badge ${dirty ? 'warn' : 'ok'}`
-  }
-  const save = document.getElementById('save-btn') as HTMLButtonElement | null
-  if (save) {
-    save.disabled = !dirty || state.busy
-    save.textContent = state.busy ? '保存中…' : '保存'
+    dirtyEl.textContent = pending ? '有未保存修改' : '已保存'
+    dirtyEl.className = `badge ${pending ? 'warn' : 'ok'}`
   }
   const refresh = document.getElementById('refresh-btn') as HTMLButtonElement | null
   if (refresh) refresh.disabled = state.busy
+  const importButton = document.getElementById('import-btn') as HTMLButtonElement | null
+  if (importButton) importButton.disabled = state.busy
+  const exportButton = document.getElementById('export-btn') as HTMLButtonElement | null
+  if (exportButton) exportButton.disabled = state.busy
 }
 
 function header(): HTMLElement {
-  const save = h('button', { class: 'btn primary', text: '保存', type: 'button', attrs: { id: 'save-btn' } })
-  save.addEventListener('click', () => void saveConfig())
   const refresh = h('button', { class: 'btn ghost', text: '刷新', type: 'button', attrs: { id: 'refresh-btn' } })
   refresh.addEventListener('click', () => void reload())
-  const importButton = h('button', { class: 'btn', text: '导入', type: 'button' })
+  const importButton = h('button', { class: 'btn', text: '导入', type: 'button', attrs: { id: 'import-btn' } })
   importButton.addEventListener('click', () => void importConfig())
-  const exportButton = h('button', { class: 'btn', text: '导出', type: 'button' })
+  const exportButton = h('button', { class: 'btn', text: '导出', type: 'button', attrs: { id: 'export-btn' } })
   exportButton.addEventListener('click', () => exportConfig())
 
   return h(
@@ -61,8 +65,11 @@ function header(): HTMLElement {
     h(
       'div',
       { class: 'actions' },
-      h('span', { class: 'badge ok', text: '已保存', attrs: { id: 'dirty' } }),
-      save,
+      h('span', {
+        class: 'badge ok',
+        text: '已保存',
+        attrs: { id: 'dirty', title: '模型改动会立即保存；供应商和默认设置需要点页面里的保存' },
+      }),
       refresh,
       importButton,
       exportButton,
@@ -119,39 +126,12 @@ function render(): void {
   app.append(main)
 
   if (state.activeTab === 'overview') renderOverview(main, goTab)
-  else if (state.activeTab === 'providers') renderProviders(main, render)
-  else if (state.activeTab === 'models') renderModels(main, render)
-  else if (state.activeTab === 'settings') renderSettings(main)
+  else if (state.activeTab === 'service') renderService(main, render)
+  else if (state.activeTab === 'settings') renderSettings(main, render)
   else renderUsage(main)
 
   updateHeader()
   void resizePage()
-}
-
-async function saveConfig(): Promise<void> {
-  if (!state.config || state.busy) return
-  setBusy(true)
-  try {
-    const data = await api.saveConfig({ version: state.version, config: toInput(state.config) })
-    applySaved(data)
-    render()
-    await toast('已保存', 'success')
-  } catch (err) {
-    if (err instanceof ApiError && err.status === 409) {
-      const ok = await confirmDialog('配置已经被别处修改，重新加载会丢弃当前未保存的修改。', '重新加载')
-      if (ok) await load()
-    } else if (err instanceof ApiError && err.payload && typeof err.payload === 'object' && 'errors' in err.payload) {
-      const errors = (err.payload as { errors?: typeof state.issues }).errors
-      if (errors) state.issues = errors
-      render()
-      await toast('配置有误，请按提示修改', 'error')
-    } else {
-      await toast(err instanceof Error ? err.message : String(err), 'error')
-    }
-  } finally {
-    setBusy(false)
-    updateHeader()
-  }
 }
 
 async function load(): Promise<void> {
@@ -165,6 +145,9 @@ async function load(): Promise<void> {
     setMeta(meta)
     const data = await api.getConfig()
     setLoaded(data)
+    clearPending()
+    resetServiceState()
+    resetSettingsDraft()
     render()
   } catch (err) {
     if (app) {
@@ -183,35 +166,61 @@ async function load(): Promise<void> {
 }
 
 async function reload(): Promise<void> {
-  if (isDirty()) {
-    const ok = await confirmDialog('刷新会丢弃当前未保存的修改。', '刷新')
+  if (hasPendingEdits()) {
+    const ok = await confirmDialog('刷新会丢弃页面上未保存的供应商 / 设置修改。', '刷新')
     if (!ok) return
   }
   await load()
 }
 
-async function importConfig(): Promise<void> {
+function importConfig(): void {
   const input = h('input', { type: 'file', attrs: { accept: 'application/json,.json' }, style: 'display:none' })
   document.body.append(input)
   input.addEventListener('change', async () => {
     const file = input.files?.[0]
     input.remove()
     if (!file) return
+    let imported: AppConfigDraft
+    let dropped: string[]
     try {
-      const draft = normalizeDraft(JSON.parse(await file.text()))
-      if (isDirty()) {
-        const ok = await confirmDialog('导入会覆盖当前未保存的修改。', '导入')
-        if (!ok) return
-      }
-      state.config = draft
-      state.issues = []
-      state.corrupt = false
-      emit()
-      render()
-      await toast('已导入，检查后点保存', 'success')
+      const normalized = normalizeDraft(JSON.parse(await file.text()))
+      const reconciled = reconcileKeyState(normalized, state.saved)
+      imported = reconciled.draft
+      dropped = reconciled.dropped
     } catch (err) {
       await toast(`导入失败：${err instanceof Error ? err.message : String(err)}`, 'error')
+      return
     }
+    if (hasPendingEdits()) {
+      const ok = await confirmDialog('导入会覆盖配置，并丢弃页面上未保存的供应商 / 设置修改。', '导入')
+      if (!ok) return
+    }
+    if (dropped.length) {
+      // 这些供应商的地址/协议和本机不一致，本机已存的 Key 不会被继承（也不会被沿用），
+      // 导入后必须重新填写；不提示的话页面会显示「未设置 Key」而用户不知道为什么。
+      const preview = dropped.slice(0, 5).join('、')
+      const more = dropped.length > 5 ? ` 等 ${dropped.length} 个` : ''
+      const ok = await confirmDialog(
+        `这些供应商的接口地址或协议和本机配置不一致，API Key 需要重新填写：${preview}${more}。继续导入吗？`,
+        '继续导入',
+      )
+      if (!ok) return
+    }
+    const ok = await updateConfig(
+      (target) => {
+        target.providers = imported.providers.map((provider) => clone(provider))
+        target.models = imported.models.map((model) => clone(model))
+        target.default_model = imported.default_model
+        target.request_timeout_ms = imported.request_timeout_ms
+        target.max_retries = imported.max_retries
+      },
+      { success: '已导入配置' },
+    )
+    if (!ok) return
+    clearPending()
+    resetServiceState()
+    resetSettingsDraft()
+    render()
   })
   input.click()
 }
@@ -220,12 +229,18 @@ function exportConfig(): void {
   if (!state.config) return
   const data = toExport(state.config, state.version, state.updatedAt)
   download('llm-config.json', `${JSON.stringify(data, null, 2)}\n`)
-  void toast('已导出（不含 API Key）', 'success')
+  const omitted = new Set(data.providers.flatMap((provider) => provider.headers_omitted ?? []))
+  const omittedNote = omitted.size ? `；${[...omitted].slice(0, 5).join('、')} 等 ${omitted.size} 个自定义请求头已剔除` : ''
+  if (hasPendingEdits()) {
+    void toast(`已导出已保存的配置；未保存的供应商 / 设置修改不在文件里${omittedNote}`, 'warning')
+  } else {
+    void toast(`已导出（不含 API Key 和敏感请求头${omittedNote}）`, 'success')
+  }
 }
 
 function installGuards(): void {
   window.addEventListener('beforeunload', (event) => {
-    if (!isDirty()) return
+    if (!hasPendingEdits()) return
     event.preventDefault()
     event.returnValue = ''
   })
@@ -234,8 +249,10 @@ function installGuards(): void {
 
 async function boot(): Promise<void> {
   installGuards()
+  configureSaving({ reload: load, rerender: render })
   const initial = new URLSearchParams(location.search).get('tab')
-  if (initial && TABS.some((item) => item.id === initial)) state.activeTab = initial as Tab
+  const legacy = initial === 'providers' || initial === 'models' ? 'service' : initial
+  if (legacy && TABS.some((item) => item.id === legacy)) state.activeTab = legacy as Tab
   await setPageTitle('LLM 接口')
   await load()
 }

@@ -1,8 +1,9 @@
-import type { ChatMessage, ChatRequest, ToolChoice } from './contract.js'
+import type { ChatMessage, ChatRequest, ContentPart, MessageContent, ToolChoice } from './contract.js'
 import { LLMError } from './errors.js'
 import { isRecord } from './json.js'
 
 const ROLES = new Set(['system', 'user', 'assistant', 'tool'])
+const PART_TYPES = new Set(['text', 'image', 'audio', 'file'])
 
 function bad(message: string): never {
   throw new LLMError('bad_request', message)
@@ -19,14 +20,66 @@ function checkArguments(text: string, where: string): void {
   if (!isRecord(value)) bad(`${where} 的 arguments 必须是 JSON 对象`)
 }
 
+/** 把内容统一成片段数组；字符串视为单个 text 片段 */
+export function contentParts(content: MessageContent | undefined): ContentPart[] {
+  if (content === undefined) return []
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : []
+  return content
+}
+
+/** 内容里所有 text 片段拼起来的纯文本；用于「有没有实际内容」的判断与结果回填 */
+export function textOfContent(content: MessageContent | undefined): string {
+  if (content === undefined) return ''
+  if (typeof content === 'string') return content
+  return content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('')
+}
+
+function checkPart(part: unknown, where: string): void {
+  if (!isRecord(part)) bad(`${where} 必须是对象`)
+  const type = part['type']
+  if (typeof type !== 'string' || !PART_TYPES.has(type)) {
+    bad(`${where}.type 只能是 ${[...PART_TYPES].join(' / ')}`)
+  }
+  if (type === 'text') {
+    if (typeof part['text'] !== 'string') bad(`${where}.text 必须是字符串`)
+    return
+  }
+  // 非文本片段必须给出 url 或 data 之一
+  const url = part['url']
+  const data = part['data']
+  if (url === undefined && data === undefined) bad(`${where} 需要 url 或 data`)
+  if (url !== undefined && typeof url !== 'string') bad(`${where}.url 必须是字符串`)
+  if (data !== undefined && typeof data !== 'string') bad(`${where}.data 必须是字符串`)
+  const mediaType = part['media_type']
+  if (mediaType !== undefined && typeof mediaType !== 'string') bad(`${where}.media_type 必须是字符串`)
+  if (type === 'audio' && data !== undefined) {
+    const format = part['format']
+    if (format !== undefined && typeof format !== 'string') bad(`${where}.format 必须是字符串`)
+  }
+}
+
+function checkContent(content: MessageContent | undefined, where: string, allowEmpty: boolean): void {
+  if (content === undefined) {
+    if (!allowEmpty) bad(`${where} 不能为空`)
+    return
+  }
+  if (typeof content === 'string') {
+    if (!content.trim() && !allowEmpty) bad(`${where} 不能为空`)
+    return
+  }
+  if (!Array.isArray(content)) bad(`${where} 必须是字符串或内容片段数组`)
+  content.forEach((part, index) => checkPart(part, `${where}[${index}]`))
+  if (!allowEmpty && !textOfContent(content).trim() && content.length === 0) bad(`${where} 不能为空`)
+}
+
 function checkMessage(message: ChatMessage, index: number): void {
   const where = `messages[${index}]`
   if (!isRecord(message)) bad(`${where} 必须是对象`)
   if (!ROLES.has(message.role)) bad(`${where}.role 不合法`)
-  if (message.content !== undefined && typeof message.content !== 'string') bad(`${where}.content 必须是字符串`)
+  if (message.reasoning !== undefined && typeof message.reasoning !== 'string') bad(`${where}.reasoning 必须是字符串`)
 
   if (message.role === 'system' || message.role === 'user') {
-    if (!message.content?.trim()) bad(`${where}.content 不能为空`)
+    checkContent(message.content, `${where}.content`, false)
     return
   }
   if (message.role === 'tool') {
@@ -36,7 +89,7 @@ function checkMessage(message: ChatMessage, index: number): void {
 
   const calls = message.tool_calls
   if (calls !== undefined && !Array.isArray(calls)) bad(`${where}.tool_calls 必须是数组`)
-  if (!message.content?.trim() && !calls?.length) bad(`${where} 既没有内容也没有工具调用`)
+  if (!textOfContent(message.content).trim() && !calls?.length) bad(`${where} 既没有内容也没有工具调用`)
   for (const [i, call] of (calls ?? []).entries()) {
     if (!isRecord(call)) bad(`${where}.tool_calls[${i}] 必须是对象`)
     if (!call.id) bad(`${where}.tool_calls[${i}].id 必填`)

@@ -1,6 +1,6 @@
 import type { LLMErrorCode } from './contract.js'
 import { LLMError } from './errors.js'
-import { parseRetryAfter, readTextLimited, redact, truncate } from './http.js'
+import { parseRetryAfter, readTextLimited, redact, safeDetail, truncate } from './http.js'
 import { isRecord } from './json.js'
 
 export interface UpstreamContext {
@@ -46,7 +46,8 @@ export async function upstreamError(response: Response, ctx: UpstreamContext): P
     body = null
   }
   const message = messageFrom(body) || text
-  const detail = truncate(redact(message, ctx.apiKey), 400)
+  // safeDetail = 截断 + 精确值替换 + 凭据形态模式匹配；上游常把 key 截断/拼进 Bearer 里回显
+  const detail = safeDetail(message, [ctx.apiKey], 400)
   const code = codeFor(response.status)
   const prefix = code === 'auth' ? '认证失败' : code === 'rate_limit' ? '被上游限流' : '上游返回错误'
   return new LLMError(code, `${prefix}（HTTP ${response.status}）${detail ? `：${detail}` : ''}${hintFor(response.status)}`, {
@@ -55,6 +56,36 @@ export async function upstreamError(response: Response, ctx: UpstreamContext): P
     status: response.status,
     ...(detail ? { detail } : {}),
   })
+}
+
+/**
+ * 把流内的 `{"error":…}` 映射成 LLMError。
+ *
+ * OpenAI 兼容网关（OpenRouter、各类中转、vLLM）经常在 **HTTP 200 的 SSE 流里**下发错误，
+ * 而不是用 4xx；旧实现忽略这些事件，最后误报成「上游没有返回内容」，真实原因（配额、鉴权、
+ * 内容策略）全被吞掉。
+ */
+export function streamError(error: unknown, ctx: UpstreamContext): LLMError {
+  const record = isRecord(error) ? error : {}
+  const type = typeof record['type'] === 'string' ? record['type'] : ''
+  const code = typeof record['code'] === 'string' ? record['code'] : ''
+  const message = typeof record['message'] === 'string' ? record['message'] : ''
+  const mapped = codeForStream(type || code)
+  const detail = safeDetail(message || type || code || '上游流式返回错误', [ctx.apiKey], 400)
+  return new LLMError(mapped, detail, {
+    provider: ctx.provider,
+    alias: ctx.alias,
+    ...(type || code ? { detail: type || code } : {}),
+  })
+}
+
+function codeForStream(value: string): LLMErrorCode {
+  const lower = value.toLowerCase()
+  if (lower.includes('auth') || lower.includes('permission') || lower.includes('invalid_api_key')) return 'auth'
+  if (lower.includes('rate') || lower.includes('quota') || lower.includes('limit')) return 'rate_limit'
+  if (lower.includes('invalid') || lower.includes('not_found') || lower.includes('too_large')) return 'bad_request'
+  if (lower.includes('timeout')) return 'timeout'
+  return 'upstream'
 }
 
 export function shouldRetryStatus(status: number): boolean {
@@ -79,7 +110,7 @@ export function fetchError(err: unknown, ctx: UpstreamContext, timedOut: boolean
       cause: err,
     })
   }
-  return new LLMError('network', `连接上游失败：${truncate(err instanceof Error ? err.message : String(err), 200)}`, {
+  return new LLMError('network', `连接上游失败：${truncate(redact(err instanceof Error ? err.message : String(err)), 200)}`, {
     provider: ctx.provider,
     alias: ctx.alias,
     cause: err,

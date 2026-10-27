@@ -8,10 +8,15 @@ export interface MetaResponse {
   protocols: ProtocolMeta[]
   limits: {
     timeout_min: number
+    /** 配置里能填的上限 */
     timeout_max: number
+    /** 单次调用实际生效的上限（一次事件所有插件合计 30 秒） */
+    call_timeout_max: number
     max_retries: number
     max_tokens_max: number
     body_max_bytes: number
+    response_max_bytes: number
+    stream_max_bytes: number
   }
 }
 
@@ -31,6 +36,8 @@ export interface ConfigPutResponse {
   ok: true
   config: PublicConfig
   issues: ConfigIssue[]
+  /** 因为接口地址 / 协议变化而没有沿用已存密钥的供应商 id */
+  dropped_secrets: string[]
 }
 
 export interface TestRequest {
@@ -58,4 +65,6 @@ export interface ApiError {
   code?: string
   errors?: ConfigIssue[]
   config?: PublicConfig
+  /** 因为接口地址 / 协议变化而没有沿用已存密钥的供应商 id */
+  dropped_secrets?: string[]
 }

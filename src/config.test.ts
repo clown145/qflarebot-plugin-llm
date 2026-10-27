@@ -34,13 +34,32 @@ describe('normalizeConfig', () => {
     expect(config.providers[0]?.base_url).toBe('https://x.test/v1')
     expect(config.providers[0]?.api_key).toBeUndefined()
     expect(config.models[0]?.enabled).toBe(true)
-    expect(config.request_timeout_ms).toBe(25000)
+    expect(config.request_timeout_ms).toBe(15000)
   })
 
   it('坏值退回默认结构，不抛错', () => {
     const config = normalizeConfig('bad')
     expect(config.providers).toEqual([])
     expect(config.version).toBe(1)
+  })
+
+  it('模型元数据字段保留，能力去重并补 text', () => {
+    const config = normalizeConfig({
+      providers: [{ id: 'p', protocol: 'openai', base_url: 'https://api.test/v1' }],
+      models: [{
+        alias: 'a',
+        provider: 'p',
+        model: 'm',
+        context_window: 128000,
+        max_output_tokens: 8192,
+        capabilities: ['image', 'tools', 'image'],
+      }],
+    })
+    expect(config.models[0]).toMatchObject({
+      context_window: 128000,
+      max_output_tokens: 8192,
+      capabilities: ['text', 'image', 'tools'],
+    })
   })
 })
 
@@ -92,6 +111,20 @@ describe('validateConfig', () => {
     expect(errors.some((item) => item.path.endsWith('base_url'))).toBe(true)
     expect(errors.some((item) => item.path === 'request_timeout_ms')).toBe(true)
   })
+
+  it('模型上下文、输出上限和能力都会校验', () => {
+    const config = sample()
+    config.models[0] = {
+      ...config.models[0]!,
+      context_window: 0,
+      max_output_tokens: 0,
+      capabilities: ['vision' as never],
+    }
+    const errors = validateConfig(config).filter((item) => item.level === 'error')
+    expect(errors.some((item) => item.path.endsWith('context_window'))).toBe(true)
+    expect(errors.some((item) => item.path.endsWith('max_output_tokens'))).toBe(true)
+    expect(errors.some((item) => item.path.endsWith('capabilities'))).toBe(true)
+  })
 })
 
 describe('resolveTarget', () => {
@@ -109,5 +142,20 @@ describe('resolveTarget', () => {
     config.models = [config.models[0]!]
     config.providers[0]!.enabled = false
     expect(() => resolveTarget(config, 'chat')).toThrow(/已停用/)
+  })
+
+  it('模型信息带上上下文、输出上限和能力', () => {
+    const config = sample()
+    config.models[0] = {
+      ...config.models[0]!,
+      context_window: 200000,
+      max_output_tokens: 8192,
+      capabilities: ['text', 'image', 'reasoning'],
+    }
+    expect(resolveTarget(config, 'chat').info).toMatchObject({
+      context_window: 200000,
+      max_output_tokens: 8192,
+      capabilities: ['text', 'image', 'reasoning'],
+    })
   })
 })

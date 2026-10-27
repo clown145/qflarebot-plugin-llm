@@ -1,8 +1,14 @@
-import { LIMITS, type ConfigIssue, type StoredConfig } from './types.js'
+import { looksLikeSecret } from '../redact.js'
+import { CAPABILITY_VALUES, LIMITS, type ConfigIssue, type StoredConfig } from './types.js'
 
 const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/
 const MODEL_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,39}$/
-const RESERVED_HEADERS = new Set(['authorization', 'x-api-key'])
+/** 由适配器按 api_key 生成的鉴权头；用户再写一份只会产生冲突值（实测会拼成 "Bearer a, Bearer b"） */
+const MANAGED_HEADERS = new Set(['authorization', 'proxy-authorization', 'x-api-key', 'api-key', 'host', 'content-length', 'content-type'])
+/** 私网 / 回环 / 元数据地址：密钥不该发到这些地方 */
+const PRIVATE_HOST = /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)$/i
+const MAX_CONTEXT_WINDOW = 10_000_000
+const MAX_OUTPUT_TOKENS = 1_000_000
 
 function issue(level: ConfigIssue['level'], path: string, message: string): ConfigIssue {
   return { level, path, message }
@@ -11,6 +17,11 @@ function issue(level: ConfigIssue['level'], path: string, message: string): Conf
 function checkTimeout(value: number, path: string, issues: ConfigIssue[]): void {
   if (!Number.isInteger(value) || value < LIMITS.timeout_min || value > LIMITS.timeout_max) {
     issues.push(issue('error', path, `超时应在 ${LIMITS.timeout_min}–${LIMITS.timeout_max} 毫秒之间`))
+    return
+  }
+  if (value > LIMITS.call_timeout_max) {
+    // 老配置里存过 25000/28000 照常能用，但实际发请求时会被压到这个上限
+    issues.push(issue('warn', path, `超过单次调用实际上限 ${LIMITS.call_timeout_max} 毫秒，会被压到这个值`))
   }
 }
 
@@ -23,16 +34,23 @@ function checkBaseUrl(value: string, path: string, issues: ConfigIssue[]): void 
     issues.push(issue('error', path, '不能包含空白字符'))
     return
   }
+  let url: URL
   try {
-    const url = new URL(value)
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-      issues.push(issue('error', path, '只支持 http(s) 地址'))
-    }
-    if (url.username || url.password) {
-      issues.push(issue('warn', path, '不要在接口地址里写用户名/密码；密钥请放到 API Key 字段'))
-    }
+    url = new URL(value)
   } catch {
     issues.push(issue('error', path, '不是合法的 URL'))
+    return
+  }
+  if (url.protocol !== 'https:') {
+    // API Key 走 Authorization 头，明文 HTTP 会在链路上暴露
+    issues.push(issue('error', path, '只支持 https 地址；用 http 会把 API Key 明文发出去'))
+    return
+  }
+  if (url.username || url.password) {
+    issues.push(issue('error', path, '不要在接口地址里写用户名/密码；密钥请放到 API Key 字段'))
+  }
+  if (PRIVATE_HOST.test(url.hostname)) {
+    issues.push(issue('error', path, '不能是回环或内网地址；API Key 会被发到内网服务'))
   }
 }
 
@@ -70,9 +88,15 @@ export function validateConfig(config: StoredConfig): ConfigIssue[] {
     if (provider.timeout_ms !== undefined) checkTimeout(provider.timeout_ms, `${base}.timeout_ms`, issues)
     if (!provider.api_key) issues.push(issue('warn', `${base}.api_key`, '未设置 API Key；上游要求认证时会调用失败'))
 
-    for (const key of Object.keys(provider.headers ?? {})) {
-      if (RESERVED_HEADERS.has(key.toLowerCase())) {
-        issues.push(issue('warn', `${base}.headers`, `${key} 会由适配器按 API Key 生成，这里的值不会生效`))
+    for (const [key, value] of Object.entries(provider.headers ?? {})) {
+      const lower = key.toLowerCase()
+      if (MANAGED_HEADERS.has(lower)) {
+        // 适配器会用 api_key 覆盖同名头，两处都写会拼出坏值（实测 "Bearer a, Bearer b"）
+        issues.push(issue('error', `${base}.headers`, `${key} 由适配器按 API Key 生成，不要在这里重复设置`))
+        continue
+      }
+      if (looksLikeSecret(value)) {
+        issues.push(issue('warn', `${base}.headers`, `${key} 看起来像密钥；导出时会被剔除，建议改放到 API Key 字段`))
       }
     }
 
@@ -96,12 +120,13 @@ export function validateConfig(config: StoredConfig): ConfigIssue[] {
       aliases.set(model.alias, index)
     }
 
+    const provider = model.provider ? config.providers.find((item) => item.id === model.provider) : undefined
     if (!model.provider) {
       issues.push(issue('error', `${base}.provider`, '必填'))
-    } else {
-      const provider = config.providers.find((item) => item.id === model.provider)
-      if (!provider) issues.push(issue('error', `${base}.provider`, `供应商 ${model.provider} 不存在`))
-      else if (!provider.enabled) issues.push(issue('warn', `${base}.provider`, `供应商 ${model.provider} 已停用`))
+    } else if (!provider) {
+      issues.push(issue('error', `${base}.provider`, `供应商 ${model.provider} 不存在`))
+    } else if (!provider.enabled) {
+      issues.push(issue('warn', `${base}.provider`, `供应商 ${model.provider} 已停用`))
     }
 
     if (!model.model) issues.push(issue('error', `${base}.model`, '必填'))
@@ -109,6 +134,26 @@ export function validateConfig(config: StoredConfig): ConfigIssue[] {
 
     if (model.max_tokens !== undefined && (!Number.isInteger(model.max_tokens) || model.max_tokens < 1 || model.max_tokens > LIMITS.max_tokens_max)) {
       issues.push(issue('error', `${base}.max_tokens`, `应在 1–${LIMITS.max_tokens_max} 之间`))
+    }
+    if (model.context_window !== undefined && (!Number.isInteger(model.context_window) || model.context_window < 1 || model.context_window > MAX_CONTEXT_WINDOW)) {
+      issues.push(issue('error', `${base}.context_window`, `应在 1–${MAX_CONTEXT_WINDOW} 之间`))
+    }
+    if (model.max_output_tokens !== undefined && (!Number.isInteger(model.max_output_tokens) || model.max_output_tokens < 1 || model.max_output_tokens > MAX_OUTPUT_TOKENS)) {
+      issues.push(issue('error', `${base}.max_output_tokens`, `应在 1–${MAX_OUTPUT_TOKENS} 之间`))
+    }
+    if (model.max_tokens !== undefined && model.max_output_tokens !== undefined && model.max_tokens > model.max_output_tokens) {
+      issues.push(issue('warn', `${base}.max_tokens`, '默认输出上限大于模型输出上限'))
+    }
+    if (model.capabilities !== undefined) {
+      const allowed = new Set<string>(CAPABILITY_VALUES)
+      const unknown = model.capabilities.filter((item) => !allowed.has(item))
+      if (unknown.length) issues.push(issue('error', `${base}.capabilities`, `不支持的能力：${unknown.join('、')}`))
+      if (provider?.protocol === 'anthropic' && model.capabilities.includes('json')) {
+        issues.push(issue('warn', `${base}.capabilities`, 'Anthropic 协议不支持 JSON 输出'))
+      }
+      if (provider?.protocol === 'anthropic' && model.capabilities.includes('audio')) {
+        issues.push(issue('warn', `${base}.capabilities`, 'Anthropic 协议不支持音频输入'))
+      }
     }
     if (model.temperature !== undefined && (typeof model.temperature !== 'number' || model.temperature < 0 || model.temperature > 2)) {
       issues.push(issue('error', `${base}.temperature`, '应在 0–2 之间'))

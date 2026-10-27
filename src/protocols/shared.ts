@@ -1,4 +1,4 @@
-import type { FinishReason, Usage } from '../contract.js'
+import type { ContentPart, FinishReason, MessageContent, Usage } from '../contract.js'
 import { asNumber, isRecord } from '../json.js'
 
 /** 去掉尾部斜杠；如果用户已经写到了具体端点，就不再重复拼 */
@@ -7,20 +7,53 @@ export function endpointUrl(baseUrl: string, endpoint: string): string {
   if (base.endsWith(endpoint)) return base
   const query = base.indexOf('?')
   if (query >= 0) {
-    const path = base.slice(0, query)
+    const path = base.slice(0, query).replace(/\/+$/, '')
     if (path.endsWith(endpoint)) return base
     return `${path}${endpoint}${base.slice(query)}`
   }
   return `${base}${endpoint}`
 }
 
+/** 非文本片段的 url：`data` + `media_type` 拼成 data URI；只有 url 时原样返回 */
+export function partUrl(part: Exclude<ContentPart, { type: 'text' }>): string {
+  if (part.url) return part.url
+  if (!part.data) return ''
+  const mediaType = part.media_type ?? 'application/octet-stream'
+  return `data:${mediaType};base64,${part.data}`
+}
+
+/** 把消息内容统一成片段数组；字符串视为单个 text 片段（空字符串得到空数组） */
+export function toParts(content: MessageContent | undefined): ContentPart[] {
+  if (content === undefined) return []
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : []
+  return content
+}
+
+/** 内容里所有 text 片段拼起来的纯文本 */
+export function textOf(content: MessageContent | undefined): string {
+  if (content === undefined) return ''
+  if (typeof content === 'string') return content
+  return content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('')
+}
+
 /** 拉模型列表用：如果 base_url 写到了 chat 端点，退回到它的上一级 */
 export function modelsUrl(baseUrl: string): string {
-  let base = baseUrl.trim().replace(/\/+$/, '')
-  for (const suffix of ['/chat/completions', '/messages']) {
-    if (base.endsWith(suffix)) base = base.slice(0, -suffix.length)
+  const trimmed = baseUrl.trim()
+  let splitAt = -1
+  for (const mark of ['?', '#']) {
+    const at = trimmed.indexOf(mark)
+    if (at >= 0 && (splitAt < 0 || at < splitAt)) splitAt = at
   }
-  return `${base}/models`
+  let path = splitAt >= 0 ? trimmed.slice(0, splitAt) : trimmed
+  const suffix = splitAt >= 0 ? trimmed.slice(splitAt) : ''
+  path = path.replace(/\/+$/, '')
+  for (const endpoint of ['/chat/completions', '/messages']) {
+    if (path.endsWith(endpoint)) {
+      path = path.slice(0, -endpoint.length)
+      break
+    }
+  }
+  return `${path}/models${suffix}`
 }
 
 export function openAIUsage(raw: unknown): Usage | undefined {
@@ -49,12 +82,12 @@ export function anthropicUsage(raw: unknown): Usage | undefined {
 export function mergeUsage(previous: Usage | undefined, next: Usage | undefined): Usage | undefined {
   if (!previous) return next
   if (!next) return previous
-  // Anthropic 的 message_delta.usage 是累计值，不是增量；用最新值覆盖，再重算 total
+  // Anthropic 的 message_delta.usage 是**累计值**，不是增量；而且它给的 total 只覆盖本次 delta
+  // （message_start 给 input，message_delta 只带 output）。所以不能信 next.total_tokens——
+  // 信了就会把 {input:2, output:3} 算成 total 3。统一用合并后的 input+output 重算。
   const input = next.input_tokens ?? previous.input_tokens
   const output = next.output_tokens ?? previous.output_tokens
-  const total =
-    next.total_tokens ??
-    (input !== undefined || output !== undefined ? (input ?? 0) + (output ?? 0) : previous.total_tokens)
+  const total = input !== undefined || output !== undefined ? (input ?? 0) + (output ?? 0) : previous.total_tokens
   return {
     ...(input !== undefined ? { input_tokens: input } : {}),
     ...(output !== undefined ? { output_tokens: output } : {}),

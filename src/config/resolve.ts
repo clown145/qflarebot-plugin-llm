@@ -9,11 +9,15 @@ export interface ResolvedTarget {
 }
 
 export function modelInfo(provider: ProviderConfig, model: ModelConfig): ModelInfo {
+  const configured = model.capabilities?.length ? model.capabilities : capabilitiesOf(provider.protocol)
+  const capabilities = configured.includes('text') ? configured : (['text', ...configured] as ModelInfo['capabilities'])
   return {
     alias: model.alias,
     provider: provider.id,
     model: model.model,
-    capabilities: capabilitiesOf(provider.protocol),
+    capabilities,
+    ...(model.context_window !== undefined ? { context_window: model.context_window } : {}),
+    ...(model.max_output_tokens !== undefined ? { max_output_tokens: model.max_output_tokens } : {}),
     ...(model.max_tokens !== undefined ? { max_tokens: model.max_tokens } : {}),
     ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),
   }
@@ -57,13 +61,16 @@ export function resolveProvider(config: StoredConfig, providerId: string): Resol
 }
 
 export function listModels(config: StoredConfig): ModelInfo[] {
-  return config.models
-    .filter((model) => {
-      if (!model.enabled) return false
-      const provider = config.providers.find((item) => item.id === model.provider)
-      return Boolean(provider?.enabled)
-    })
-    .map((model) => modelInfo(config.providers.find((item) => item.id === model.provider)!, model))
+  // 一次建索引，避免 O(n²)：供应商多、别名多时这段在热路径上（调用方每次 listModels 都会走）
+  const providers = new Map(config.providers.map((provider) => [provider.id, provider]))
+  const out: ModelInfo[] = []
+  for (const model of config.models) {
+    if (!model.enabled) continue
+    const provider = providers.get(model.provider)
+    if (!provider?.enabled) continue
+    out.push(modelInfo(provider, model))
+  }
+  return out
 }
 
 export function toResolvedModel(target: ResolvedTarget): ResolvedModel {

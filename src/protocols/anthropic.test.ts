@@ -44,9 +44,69 @@ describe('anthropic.buildChat', () => {
     expect((built.init.headers as Record<string, string>)['x-api-key']).toBe('sk-ant')
     expect((built.init.headers as Record<string, string>)['anthropic-version']).toBe('2023-06-01')
     expect(body.system).toBe('规则一\n\n规则二')
-    expect(body.max_tokens).toBe(1024)
+    // 未传 max_tokens 时用兜底值；旧实现的 1024 会静默截断长回答
+    expect(body.max_tokens).toBe(4096)
     expect(body.messages).toHaveLength(1)
     expect(body.messages[0].content).toEqual([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }])
+  })
+
+  it('max_tokens 优先取请求值，其次模型配置的输出上限', () => {
+    const withRequest = anthropic.buildChat(target, {
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 512,
+    }, false)
+    expect(JSON.parse(withRequest.init.body as string).max_tokens).toBe(512)
+
+    const configured = anthropic.buildChat(
+      { ...target, model: { ...target.model, max_output_tokens: 8192 } },
+      { messages: [{ role: 'user', content: 'x' }] },
+      false,
+    )
+    expect(JSON.parse(configured.init.body as string).max_tokens).toBe(8192)
+  })
+
+  it("tool_choice: 'none' 时不发送 tools（Anthropic 没有 none 类型）", () => {
+    const built = anthropic.buildChat(target, {
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ name: 'lookup', parameters: { type: 'object', properties: {} } }],
+      tool_choice: 'none',
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.tools).toBeUndefined()
+    expect(body.tool_choice).toBeUndefined()
+  })
+
+  it('图片片段转 base64 source，音频片段抛 unsupported', () => {
+    const built = anthropic.buildChat(target, {
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image', data: 'AAAA', media_type: 'image/png' },
+        ],
+      }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content).toEqual([
+      { type: 'text', text: '看图' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+    ])
+
+    expect(() =>
+      anthropic.buildChat(target, {
+        messages: [{ role: 'user', content: [{ type: 'audio', data: 'AAAA', format: 'wav' }] }],
+      }, false),
+    ).toThrow(/unsupported|音频/)
+  })
+
+  it('file 片段转 document source', () => {
+    const built = anthropic.buildChat(target, {
+      messages: [{ role: 'user', content: [{ type: 'file', url: 'https://x.test/a.pdf', media_type: 'application/pdf' }] }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content).toEqual([
+      { type: 'document', source: { type: 'url', url: 'https://x.test/a.pdf' } },
+    ])
   })
 
   it('工具定义、tool_use 与 tool_result 的映射', () => {
@@ -138,10 +198,66 @@ describe('anthropic.parseStream', () => {
   it('上游 error 事件会抛错', async () => {
     await expect(events(['event: error\ndata: {"type":"error","error":{"message":"boom"}}\n\n'])).rejects.toThrow(/boom/)
   })
+
+  it('error 事件按上游类型映射错误码', async () => {
+    const cases = [
+      ['rate_limit_error', 'rate_limit'],
+      ['authentication_error', 'auth'],
+      ['permission_error', 'auth'],
+      ['invalid_request_error', 'bad_request'],
+      ['overloaded_error', 'upstream'],
+    ] as const
+    for (const [type, code] of cases) {
+      const error = await events([
+        `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type, message: 'x' } })}\n\n`,
+      ]).catch((err: unknown) => err)
+      expect(error).toMatchObject({ code, detail: type })
+    }
+  })
 })
 
 describe('anthropic.parseListModels', () => {
   it('读 data[].id', () => {
     expect(anthropic.parseListModels({ data: [{ id: 'a' }, { id: 'b' }] })).toEqual(['a', 'b'])
+  })
+})
+
+describe('anthropic 推理内容与错误脱敏', () => {
+  it('parseResponse 把 thinking block 拼进 reasoning', () => {
+    const parsed = anthropic.parseResponse({
+      content: [
+        { type: 'thinking', thinking: '先想一下' },
+        { type: 'text', text: '答案' },
+      ],
+      stop_reason: 'end_turn',
+    })
+    expect(parsed.reasoning).toBe('先想一下')
+    expect(parsed.text).toBe('答案')
+  })
+
+  it('thinking_delta 产出 reasoning_delta', async () => {
+    const out = await events([
+      'event: content_block_delta\ndata: {"index":0,"delta":{"type":"thinking_delta","thinking":"嗯"}}\n\n',
+      'event: content_block_delta\ndata: {"index":0,"delta":{"type":"text_delta","text":"好"}}\n\n',
+    ])
+    expect(out.filter((item) => item.type === 'reasoning_delta')).toEqual([{ type: 'reasoning_delta', text: '嗯' }])
+    expect(out.filter((item) => item.type === 'text_delta')).toEqual([{ type: 'text_delta', text: '好' }])
+  })
+
+  it('流式 error 的 message 会被脱敏', async () => {
+    const error = await events([
+      'event: error\ndata: {"type":"error","error":{"type":"authentication_error","message":"invalid key sk-ant-SECRET123"}}\n\n',
+    ]).catch((err: unknown) => err)
+    expect(String((error as Error).message)).not.toContain('sk-ant-SECRET123')
+  })
+
+  it('parseStream 的第二个参数能传入 apiKey 做精确脱敏', async () => {
+    const body = bodyOf([
+      'event: error\ndata: {"type":"error","error":{"type":"authentication_error","message":"bad key sk-ant-SECRET123"}}\n\n',
+    ])
+    const error = await (async () => {
+      for await (const _event of anthropic.parseStream(body, { apiKey: 'sk-ant-SECRET123' })) void _event
+    })().catch((err: unknown) => err)
+    expect(String((error as Error).message)).not.toContain('SECRET123')
   })
 })

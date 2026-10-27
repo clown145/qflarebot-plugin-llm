@@ -9,10 +9,11 @@ export type * from './contract.js'
 export default definePlugin({
   name: 'llm',
   displayName: 'LLM 接口',
-  description: '统一管理大模型供应商与模型别名，向其他插件提供 llm 服务（含工具调用透传）；不含聊天逻辑',
+  description: '统一管理大模型供应商与模型别名，向其他插件提供 llm 服务（含工具调用与多模态透传）；不含聊天逻辑',
   apiVersion: 1,
   permissions: ['net', 'kv'],
-  ui: { path: '/ui/', title: 'LLM 接口', icon: 'sparkles' },
+  // 面板侧栏目前对插件页面固定用一个图标，不读 ui.icon，所以这里不声明
+  ui: { path: '/ui/', title: 'LLM 接口' },
 
   services: {
     llm: (ctx) => new LLM({ store: createConfigStore(ctx), logger: ctx.logger }),

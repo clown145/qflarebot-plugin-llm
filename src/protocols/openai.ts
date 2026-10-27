@@ -1,13 +1,17 @@
 import type { ChatMessage, ChatRequest, ToolCall, ToolDefinition, ToolChoice } from '../contract.js'
 import type { ProviderConfig } from '../config/types.js'
+import { LLMError } from '../errors.js'
 import { asArray, asNumber, asString, isRecord } from '../json.js'
 import { readSSE } from '../sse.js'
-import type { BuiltRequest, ParsedResponse, ParsedStreamEvent, ProtocolAdapter, Target } from './types.js'
+import { streamError, type UpstreamContext } from '../upstream.js'
+import type { BuiltRequest, ParsedResponse, ParsedStreamEvent, ProtocolAdapter, StreamContext, Target } from './types.js'
 import {
   endpointUrl,
   modelsUrl,
   openAIFinish,
   openAIUsage,
+  partUrl,
+  toParts,
 } from './shared.js'
 
 function contentText(content: unknown): string {
@@ -18,28 +22,66 @@ function contentText(content: unknown): string {
     .join('')
 }
 
-function mapToolCalls(raw: unknown): ToolCall[] {
+/** DeepSeek 用 `reasoning_content`，部分兼容网关用 `reasoning` */
+function reasoningText(raw: Record<string, unknown>): string {
+  return asString(raw['reasoning_content']) || asString(raw['reasoning'])
+}
+
+/**
+ * 并行工具调用可能不带 id（部分本地/中转网关）。用递增计数器兜底，
+ * 不能按下标——同一批里两条无 id 的调用会得到同一个 `call_0`，调用方回传结果时上游分不清。
+ */
+function mapToolCalls(raw: unknown, counter: { n: number }): ToolCall[] {
   return asArray(raw).flatMap((item) => {
     if (!isRecord(item)) return []
     const fn = isRecord(item['function']) ? item['function'] : {}
     const name = asString(fn['name'])
     if (!name) return []
-    const index = asNumber(item['index'])
+    const id = asString(item['id']) || `call_${counter.n++}`
     return [{
-      id: asString(item['id']) || `call_${index ?? 0}`,
+      id,
       name,
       arguments: asString(fn['arguments']) || '{}',
     }]
   })
 }
 
+/**
+ * 把契约里的 `ContentPart[]` 转成 OpenAI Chat Completions 的 content 数组。
+ * 不支持的类型抛 `unsupported`，别把图片悄悄丢掉让调用方以为是模型没看图。
+ */
+function mapContent(content: ChatMessage['content'], where: string): unknown {
+  if (content === undefined) return ''
+  if (typeof content === 'string') return content
+  const parts = toParts(content)
+  if (parts.length === 1 && parts[0]?.type === 'text') return parts[0].text
+  return parts.map((part) => {
+    if (part.type === 'text') return { type: 'text', text: part.text }
+    if (part.type === 'image') {
+      const url = partUrl(part)
+      if (!url) throw new LLMError('bad_request', `${where} 的图片片段缺少 url 或 data`)
+      return { type: 'image_url', image_url: { url, ...(part.detail ? { detail: part.detail } : {}) } }
+    }
+    if (part.type === 'audio') {
+      // OpenAI 的 input_audio 只接受 base64 + format，不接受 URL
+      if (!part.data) throw new LLMError('unsupported', `${where} 的音频片段需要 base64 data 与 format`)
+      return { type: 'input_audio', input_audio: { data: part.data, format: part.format ?? 'wav' } }
+    }
+    throw new LLMError('unsupported', 'OpenAI 兼容协议不支持 file 片段')
+  })
+}
+
 function mapMessages(messages: ChatMessage[]): Record<string, unknown>[] {
-  return messages.map((message) => {
+  const counter = { n: 0 }
+  return messages.map((message, index) => {
+    const where = `messages[${index}]`
     if (message.role === 'assistant') {
       const toolCalls = message.tool_calls ?? []
+      const content = mapContent(message.content, where)
       return {
         role: 'assistant',
-        content: message.content ?? (toolCalls.length ? null : ''),
+        // 有工具调用又没有文本时 content 得是 null，否则部分上游会报错
+        content: content === '' && toolCalls.length ? null : content,
         ...(toolCalls.length
           ? {
               tool_calls: toolCalls.map((call) => ({
@@ -55,10 +97,10 @@ function mapMessages(messages: ChatMessage[]): Record<string, unknown>[] {
       return {
         role: 'tool',
         tool_call_id: message.tool_call_id ?? '',
-        content: message.content ?? '',
+        content: mapContent(message.content, where),
       }
     }
-    return { role: message.role, content: message.content ?? '' }
+    return { role: message.role, content: mapContent(message.content, where) }
   })
 }
 
@@ -78,12 +120,26 @@ function mapToolChoice(choice: ToolChoice): unknown {
   return { type: 'function', function: { name: choice.name } }
 }
 
+/**
+ * 用户自定义头。受管头（Authorization / x-api-key / content-type 等）一律丢掉：
+ * 保存时已被 validateConfig 拦成 error，但 KV 里可能还有历史遗留配置，
+ * 而 `Headers` 对大小写不同的同名键会**合并**成 `"Bearer a, Bearer b"` 这种坏值。
+ */
+function applyHeaders(headers: Record<string, string>, custom: Record<string, string> | undefined): void {
+  for (const [key, value] of Object.entries(custom ?? {})) {
+    if (MANAGED_HEADERS.has(key.toLowerCase())) continue
+    headers[key] = value
+  }
+}
+
+const MANAGED_HEADERS = new Set(['authorization', 'proxy-authorization', 'x-api-key', 'api-key', 'host', 'content-length', 'content-type'])
+
 function buildChat(target: Target, request: ChatRequest, stream: boolean): BuiltRequest {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     accept: stream ? 'text/event-stream' : 'application/json',
   }
-  for (const [key, value] of Object.entries(target.provider.headers ?? {})) headers[key] = value
+  applyHeaders(headers, target.provider.headers)
   if (target.provider.api_key) headers['authorization'] = `Bearer ${target.provider.api_key}`
 
   const body: Record<string, unknown> = {
@@ -115,18 +171,34 @@ function parseResponse(json: unknown): ParsedResponse {
   if (!choice) throw new Error('上游没有返回 choices')
   const message = isRecord(choice['message']) ? choice['message'] : {}
   const text = contentText(message['content'])
-  const toolCalls = mapToolCalls(message['tool_calls'])
+  const toolCalls = mapToolCalls(message['tool_calls'], { n: 0 })
+  const reasoning = reasoningText(message)
   const finishReason = openAIFinish(choice['finish_reason'])
   const usage = openAIUsage(json['usage'])
   return {
     text,
+    ...(reasoning ? { reasoning } : {}),
     ...(toolCalls.length ? { toolCalls } : {}),
     ...(finishReason ? { finishReason } : {}),
     ...(usage ? { usage } : {}),
   }
 }
 
-async function* parseStream(body: ReadableStream<Uint8Array>): AsyncGenerator<ParsedStreamEvent> {
+/** 上游上下文；适配器用它给流内 error 的 message 脱敏 */
+function upstreamOf(ctx: StreamContext | undefined, target?: Target): UpstreamContext {
+  return {
+    provider: target?.provider.id ?? '',
+    alias: target?.model.alias ?? '',
+    timeoutMs: 0,
+    ...(ctx?.apiKey ? { apiKey: ctx.apiKey } : {}),
+  }
+}
+
+async function* parseStream(
+  body: ReadableStream<Uint8Array>,
+  ctx?: StreamContext,
+): AsyncGenerator<ParsedStreamEvent> {
+  const upstream = upstreamOf(ctx)
   for await (const message of readSSE(body)) {
     if (message.data === '[DONE]') return
     let json: unknown
@@ -136,6 +208,13 @@ async function* parseStream(body: ReadableStream<Uint8Array>): AsyncGenerator<Pa
       throw new Error('上游流式数据不是合法 JSON')
     }
     if (!isRecord(json)) continue
+
+    // HTTP 200 的流里也可能下发错误（OpenRouter、各类中转、vLLM 的配额/鉴权失败都这么干）。
+    // 旧实现忽略它，流正常结束，最后误报成「上游没有返回内容」，真实原因全被吞掉。
+    const error = json['error']
+    if (isRecord(error) || typeof error === 'string') {
+      throw streamError(isRecord(error) ? error : { message: error }, upstream)
+    }
 
     const usage = openAIUsage(json['usage'])
     if (usage) yield { type: 'usage', usage }
@@ -147,6 +226,9 @@ async function* parseStream(body: ReadableStream<Uint8Array>): AsyncGenerator<Pa
 
       const text = contentText(delta['content'])
       if (text) yield { type: 'text_delta', text }
+
+      const reasoning = reasoningText(delta)
+      if (reasoning) yield { type: 'reasoning_delta', text: reasoning }
 
       for (const item of asArray(delta['tool_calls'])) {
         if (!isRecord(item)) continue
@@ -172,7 +254,7 @@ async function* parseStream(body: ReadableStream<Uint8Array>): AsyncGenerator<Pa
 
 function buildListModels(provider: ProviderConfig): BuiltRequest {
   const headers: Record<string, string> = { accept: 'application/json' }
-  for (const [key, value] of Object.entries(provider.headers ?? {})) headers[key] = value
+  applyHeaders(headers, provider.headers)
   if (provider.api_key) headers['authorization'] = `Bearer ${provider.api_key}`
   return { url: modelsUrl(provider.base_url), init: { method: 'GET', headers } }
 }

@@ -1,5 +1,7 @@
 /** HTTP 小工具：JSON 响应、请求体上限、超时/取消、错误体截断与脱敏。 */
 
+import { redact, redactAll } from './redact.js'
+
 export class HttpError extends Error {
   readonly status: number
   readonly payload?: unknown
@@ -22,11 +24,28 @@ export function json(data: unknown, status = 200): Response {
   })
 }
 
+/**
+ * 读请求体并限制大小。
+ *
+ * 上限按**字节**算：`text.length` 是 UTF-16 码元数，中文一个字占 3 字节，
+ * 按字符算等于把上限放大三倍。`content-length` 缺失（chunked）时也要靠读入后的字节数兜底，
+ * 所以先读再判，但用 `arrayBuffer` 一次拿到字节数，避免先解码再计数多一遍拷贝。
+ */
 export async function readJson(request: Request, maxBytes = 256 * 1024): Promise<unknown> {
   const declared = Number(request.headers.get('content-length') ?? '0')
   if (Number.isFinite(declared) && declared > maxBytes) throw new HttpError(413, '请求体过大')
-  const text = await request.text()
-  if (text.length > maxBytes) throw new HttpError(413, '请求体过大')
+
+  const buffer = await request.arrayBuffer()
+  if (buffer.byteLength > maxBytes) throw new HttpError(413, '请求体过大')
+
+  let text: string
+  try {
+    // workers-types 的 TextDecoder 构造参数要求 ignoreBOM；fatal 让坏字节直接抛错而不是替换成 U+FFFD
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false })
+    text = decoder.decode(buffer)
+  } catch {
+    throw new HttpError(400, '请求体不是合法的 UTF-8 文本')
+  }
   try {
     return JSON.parse(text)
   } catch {
@@ -142,12 +161,14 @@ export function parseRetryAfter(value: string | null): number | undefined {
   return Math.max(0, date - Date.now())
 }
 
-export function redact(text: string, secret?: string): string {
-  if (!secret) return text
-  return text.split(secret).join('***')
-}
+export { redact, redactAll }
 
 export function truncate(text: string, max = 400): string {
   const clean = text.replace(/\s+/g, ' ').trim()
   return clean.length > max ? `${clean.slice(0, max)}…` : clean
+}
+
+/** 截断 + 脱敏，错误消息进日志和跨插件异常前的统一出口 */
+export function safeDetail(text: string, secrets: ReadonlyArray<string | undefined> = [], max = 400): string {
+  return truncate(redactAll(text, secrets), max)
 }

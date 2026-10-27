@@ -43,4 +43,18 @@ describe('readSSE', () => {
   it('[DONE] 原样交给调用方', async () => {
     await expect(collect(['data: [DONE]\n\n'])).resolves.toEqual([{ data: '[DONE]' }])
   })
+
+  it('单个 chunk 总长超过 1MB 但每行不超限时正常解析', async () => {
+    const chunk = 'a'.repeat(600 * 1024)
+    const out = await collect([`data: ${chunk}\n\ndata: ${chunk}\n\n`])
+    expect(out.map((message) => message.data.length)).toEqual([chunk.length, chunk.length])
+  })
+
+  it('单行超过 1MB 时报错', async () => {
+    await expect(collect([`data: ${'a'.repeat(1024 * 1024)}\n\n`])).rejects.toThrow('SSE 单行过长')
+  })
+
+  it('跨 chunk 的半行超过 1MB 时报错', async () => {
+    await expect(collect(['data: ' + 'a'.repeat(700 * 1024), 'b'.repeat(700 * 1024)])).rejects.toThrow('SSE 单行过长')
+  })
 })

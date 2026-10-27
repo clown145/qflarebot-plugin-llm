@@ -36,6 +36,7 @@ export async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator
   }
 
   const accept = (line: string): SSEMessage | null => {
+    if (line.length > MAX_LINE) throw new Error('SSE 单行过长')
     if (line === '') return dispatch()
     if (line.startsWith(':')) return null
     const colon = line.indexOf(':')
@@ -52,12 +53,13 @@ export async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator
       const { done, value } = await reader.read()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
-      if (buffer.length > MAX_LINE) throw new Error('SSE 单行过长')
 
       for (let line = takeLine(); line !== null; line = takeLine()) {
         const message = accept(line)
         if (message) yield message
       }
+      // 完整行已经处理完；剩下的半行超过上限才说明单行真的过长
+      if (buffer.length > MAX_LINE) throw new Error('SSE 单行过长')
     }
 
     buffer += decoder.decode()

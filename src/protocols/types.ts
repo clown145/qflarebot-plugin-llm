@@ -13,6 +13,8 @@ export interface BuiltRequest {
 
 export interface ParsedResponse {
   text: string
+  /** 推理模型的思考内容（DeepSeek reasoning_content / Anthropic thinking） */
+  reasoning?: string
   toolCalls?: ToolCall[]
   finishReason?: FinishReason
   usage?: Usage
@@ -20,9 +22,15 @@ export interface ParsedResponse {
 
 export type ParsedStreamEvent =
   | { type: 'text_delta'; text: string }
+  | { type: 'reasoning_delta'; text: string }
   | { type: 'tool_call_delta'; index: number; id?: string; name?: string; argumentsDelta?: string }
   | { type: 'usage'; usage: Usage }
   | { type: 'finish'; reason?: FinishReason }
+
+/** 解析流式数据时用得上的上游上下文；只有需要脱敏/映射错误的适配器才会用 */
+export interface StreamContext {
+  apiKey?: string
+}
 
 export interface ProtocolAdapter {
   readonly id: ProtocolId
@@ -32,7 +40,8 @@ export interface ProtocolAdapter {
   readonly baseUrlHint: string
   buildChat(target: Target, request: ChatRequest, stream: boolean): BuiltRequest
   parseResponse(json: unknown): ParsedResponse
-  parseStream(body: ReadableStream<Uint8Array>): AsyncGenerator<ParsedStreamEvent>
+  /** `ctx` 可选，用于给流内 error 事件脱敏；不传时退化为不做精确值替换 */
+  parseStream(body: ReadableStream<Uint8Array>, ctx?: StreamContext): AsyncGenerator<ParsedStreamEvent>
   buildListModels(provider: ProviderConfig): BuiltRequest
   parseListModels(json: unknown): string[]
 }
