@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatRequest, ContentPart, FinishReason, MessageContent, ToolCall, ToolDefinition, Usage } from '../contract.js'
+import type { ChatMessage, ChatRequest, ContentPart, FinishReason, MessageContent, ThoughtSignature, ToolCall, ToolDefinition, Usage } from '../contract.js'
 import type { ProviderConfig } from '../config/types.js'
 import { LLMError } from '../errors.js'
 import { asArray, asNumber, asString, isRecord } from '../json.js'
@@ -146,17 +146,10 @@ function mapMessages(messages: ChatMessage[]): { system: string; contents: Gemin
     }
     if (message.role === 'assistant') {
       const parts: GeminiPart[] = []
-      // 思考内容文本不回传（Gemini 的 thought part 无法重建），但签名必须回传：
-      // 文本 part 的签名挂在 message.thought_signature，工具调用的挂在各自的 tool_call 上。
-      // 顺序保持「文本在前、工具调用在后」，与上游返回的 part 顺序一致。
+      // 思考内容文本不回传（Gemini 的 thought part 无法重建），但签名必须回传。
+      // 重建顺序固定为「先文本 part、后 functionCall part」，与 parseResponse 记 part_index 的口径一致。
       const textParts = contentParts(message.content, where)
-      if (textParts.length && message.thought_signature) {
-        // 签名属于文本 part：贴到最后一个文本 part 上（上游把签名放在承载该轮思考的 part 上）
-        const last = textParts[textParts.length - 1]!
-        last.thoughtSignature = message.thought_signature
-      }
-      parts.push(...textParts)
-      for (const call of message.tool_calls ?? []) {
+      const callEntries: Array<{ call: ToolCall; args: Record<string, unknown>; callIndex: number; signature?: string }> = (message.tool_calls ?? []).map((call, callIndex) => {
         let args: Record<string, unknown>
         try {
           args = JSON.parse(call.arguments || '{}') as Record<string, unknown>
@@ -164,9 +157,34 @@ function mapMessages(messages: ChatMessage[]): { system: string; contents: Gemin
           throw new LLMError('bad_request', `${where} 的工具调用参数不是合法 JSON`)
         }
         if (!isRecord(args)) throw new LLMError('bad_request', `${where} 的工具调用参数必须是 JSON 对象`)
+        return { call, args, callIndex }
+      })
+
+      // 把签名贴回对应 part：functionCall 优先按 tool_call_id 匹配，其次工具名，最后下标兜底
+      for (const item of message.thought_signatures ?? []) {
+        if (item.part_kind === 'function_call') {
+          const target =
+            callEntries.find((entry) => item.tool_call_id && entry.call.id === item.tool_call_id) ??
+            callEntries.find((entry) => item.tool_name && entry.call.name === item.tool_name) ??
+            (item.tool_call_index !== undefined ? callEntries[item.tool_call_index] : undefined)
+          if (target) target.signature = item.signature
+          continue
+        }
+        // 文本 part：按下标贴；下标越界时退回最后一个文本 part（上游把签名放在承载该轮思考的 part 上）
+        const index = item.part_index - (textParts.length ? 0 : 0)
+        const target = textParts[index] ?? textParts[textParts.length - 1]
+        if (target) target.thoughtSignature = item.signature
+      }
+
+      parts.push(...textParts)
+      for (const entry of callEntries) {
         parts.push({
-          function_call: { name: call.name, args, ...(call.id ? { id: call.id } : {}) },
-          ...(call.thought_signature ? { thoughtSignature: call.thought_signature } : {}),
+          function_call: {
+            name: entry.call.name,
+            args: entry.args,
+            ...(entry.call.id ? { id: entry.call.id } : {}),
+          },
+          ...(entry.signature ? { thoughtSignature: entry.signature } : {}),
         })
       }
       if (!parts.length) throw new LLMError('bad_request', `${where} 既没有内容也没有工具调用`)
@@ -282,30 +300,48 @@ function parseResponse(json: unknown): ParsedResponse {
   const parts = asArray(content['parts'])
   let text = ''
   let reasoning = ''
-  /** 文本 part 的签名（取最后一个带签名的文本 part；Gemini 只在这类 part 上给） */
-  let textSignature: string | undefined
+  const signatures: ThoughtSignature[] = []
   const toolCalls: ToolCall[] = []
+  // 回传时 parts 重建顺序是「先文本 part、后 functionCall part」，签名里的 part_index 按这个口径记
+  let textPartIndex = 0
   parts.forEach((raw, index) => {
     if (!isRecord(raw)) return
     const thought = raw['thought'] === true
     const partText = asString(raw['text'])
     const signature = asString(raw['thoughtSignature']) || asString(raw['thought_signature'])
-    if (partText && thought) reasoning += partText
-    else if (partText) {
+    if (partText && thought) {
+      // thought part 的文本不回传，但签名仍要保留（回传时贴在重建的文本 part 上）
+      if (signature) {
+        signatures.push({ part_index: textPartIndex, part_kind: 'text', signature })
+        textPartIndex += 1
+      }
+      reasoning += partText
+      return
+    }
+    if (partText) {
+      if (signature) signatures.push({ part_index: textPartIndex, part_kind: 'text', signature })
+      textPartIndex += 1
       text += partText
-      if (signature) textSignature = signature
+      return
     }
     const call = isRecord(raw['function_call']) ? raw['function_call'] : undefined
     if (call) {
       const name = asString(call['name'])
       if (!name) return
       const args = isRecord(call['args']) ? call['args'] : {}
-      toolCalls.push({
-        id: asString(call['id']) || `call_${index}`,
-        name,
-        arguments: JSON.stringify(args),
-        ...(signature ? { thought_signature: signature } : {}),
-      })
+      const callIndex = toolCalls.length
+      const id = asString(call['id']) || `call_${index}`
+      toolCalls.push({ id, name, arguments: JSON.stringify(args) })
+      if (signature) {
+        signatures.push({
+          part_index: textPartIndex + callIndex,
+          part_kind: 'function_call',
+          signature,
+          tool_call_index: callIndex,
+          tool_call_id: id,
+          tool_name: name,
+        })
+      }
     }
   })
   const finishReason = geminiFinish(candidate['finish_reason'] ?? candidate['finishReason'])
@@ -313,7 +349,7 @@ function parseResponse(json: unknown): ParsedResponse {
   return {
     text,
     ...(reasoning ? { reasoning } : {}),
-    ...(textSignature ? { thoughtSignature: textSignature } : {}),
+    ...(signatures.length ? { thoughtSignatures: signatures } : {}),
     ...(toolCalls.length ? { toolCalls } : {}),
     ...(finishReason ? { finishReason } : {}),
     ...(usage ? { usage } : {}),
@@ -374,6 +410,8 @@ async function* parseStream(
   // 工具槽位在整条流内连续递增：Gemini 一次响应里 parts 可能分多帧下发，
   // 每帧重置会让多个工具调用塌缩到 index 0
   let toolIndex = 0
+  // 文本 part 计数：签名里的 part_index 按「重建顺序」记（先文本、后 functionCall）
+  let textPartIndex = 0
   for await (const message of readSSE(body)) {
     if (!message.data.trim()) continue
     let json: unknown
@@ -398,16 +436,18 @@ async function* parseStream(
       if (!isRecord(raw)) continue
       const content = isRecord(raw['content']) ? raw['content'] : {}
       const parts = asArray(content['parts'])
-      // 工具槽位在整条流内连续递增（Gemini 一次响应里 parts 可能分多帧下发）
       for (const partRaw of parts) {
         if (!isRecord(partRaw)) continue
         const thought = partRaw['thought'] === true
         const text = asString(partRaw['text'])
         const signature = asString(partRaw['thoughtSignature']) || asString(partRaw['thought_signature'])
         if (text) {
+          // 文本 part 的签名按「重建顺序里的文本 part 下标」透出，调用方原样收集即可
+          if (signature) {
+            yield { type: 'thought_signature', part_index: textPartIndex, part_kind: 'text', signature }
+          }
+          textPartIndex += 1
           yield { type: thought ? 'reasoning_delta' : 'text_delta', text }
-          // 文本 part 的签名单独透出：调用方要保存它并在下一轮回传
-          if (signature && !thought) yield { type: 'thought_signature', signature }
           continue
         }
         const call = isRecord(partRaw['function_call']) ? partRaw['function_call'] : undefined
@@ -415,18 +455,30 @@ async function* parseStream(
           const name = asString(call['name'])
           if (name) {
             const args = isRecord(call['args']) ? call['args'] : {}
+            const index = toolIndex++
+            const id = asString(call['id']) || `call_${index}`
+            if (signature) {
+              yield {
+                type: 'thought_signature',
+                part_index: textPartIndex + index,
+                part_kind: 'function_call',
+                signature,
+                tool_call_index: index,
+                tool_call_id: id,
+                tool_name: name,
+              }
+            }
             yield {
               type: 'tool_call_delta',
-              index: toolIndex++,
+              index,
               id: asString(call['id']) || undefined,
               name,
               argumentsDelta: JSON.stringify(args),
-              ...(signature ? { thoughtSignature: signature } : {}),
             }
           }
-        } else if (signature && !text) {
+        } else if (signature) {
           // 既无文本也非工具调用的 part 上的签名（如纯 thinking part）：单独透出，不丢
-          yield { type: 'thought_signature', signature }
+          yield { type: 'thought_signature', part_index: textPartIndex, part_kind: 'text', signature }
         }
       }
       const reason = geminiFinish(raw['finish_reason'] ?? raw['finishReason'])

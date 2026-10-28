@@ -8,6 +8,7 @@ import type {
   PingResult,
   ResolvedModel,
   StreamEvent,
+  ThoughtSignature,
   ToolCall,
   Usage,
 } from './contract.js'
@@ -134,8 +135,8 @@ export class LLM implements LLMService {
 
     let text = ''
     let reasoning = ''
-    /** 文本 part 的 Gemini 思考签名；调用方要保存并在下一轮回传 */
-    let textSignature: string | undefined
+    /** Gemini 思考签名集合（文本与工具调用 part）；调用方要保存并在下一轮回传 */
+    const thoughtSignatures: ThoughtSignature[] = []
     const calls: (ToolCall | undefined)[] = []
     let usage: Usage | undefined
     let finishReason: FinishReason | undefined
@@ -182,10 +183,6 @@ export class LLM implements LLMService {
           if (event.id) current.id = event.id
           if (event.name) current.name = event.name
           if (event.argumentsDelta) current.arguments += event.argumentsDelta
-          if (event.thoughtSignature) {
-            current.thought_signature = event.thoughtSignature
-            count(event.thoughtSignature)
-          }
           calls[event.index] = current
           yield {
             type: 'tool_call_delta',
@@ -193,11 +190,12 @@ export class LLM implements LLMService {
             ...(event.id ? { id: event.id } : {}),
             ...(event.name ? { name: event.name } : {}),
             ...(event.argumentsDelta ? { arguments_delta: event.argumentsDelta } : {}),
-            ...(event.thoughtSignature ? { thought_signature: event.thoughtSignature } : {}),
           }
         } else if (event.type === 'thought_signature') {
-          count(event.signature)
-          textSignature = event.signature
+          const { type: _type, ...signature } = event
+          count(signature.signature)
+          thoughtSignatures.push(signature)
+          yield { type: 'thought_signature', ...signature }
         } else if (event.type === 'usage') {
           usage = mergeUsage(usage, event.usage)
         } else if (event.type === 'finish') {
@@ -234,12 +232,7 @@ export class LLM implements LLMService {
 
     const toolCalls = calls.flatMap((call, index) => {
       if (!call?.name) return []
-      return [{
-        id: call.id || `call_${index}`,
-        name: call.name,
-        arguments: call.arguments || '{}',
-        ...(call.thought_signature ? { thought_signature: call.thought_signature } : {}),
-      }]
+      return [{ id: call.id || `call_${index}`, name: call.name, arguments: call.arguments || '{}' }]
     })
     if (!text && !toolCalls.length && !reasoning && !finishReason) {
       const error = new LLMError('bad_response', '上游没有返回内容', {
@@ -255,7 +248,7 @@ export class LLM implements LLMService {
       {
         text,
         ...(reasoning ? { reasoning } : {}),
-        ...(textSignature ? { thoughtSignature: textSignature } : {}),
+        ...(thoughtSignatures.length ? { thoughtSignatures } : {}),
         ...(toolCalls.length ? { toolCalls } : {}),
         ...(finishReason ? { finishReason } : {}),
         ...(usage ? { usage } : {}),
@@ -416,7 +409,7 @@ export class LLM implements LLMService {
     return {
       text: parsed.text,
       ...(parsed.reasoning ? { reasoning: parsed.reasoning } : {}),
-      ...(parsed.thoughtSignature ? { thought_signature: parsed.thoughtSignature } : {}),
+      ...(parsed.thoughtSignatures?.length ? { thought_signatures: parsed.thoughtSignatures } : {}),
       ...(toolCalls ? { tool_calls: toolCalls } : {}),
       ...(finish ? { finish_reason: finish } : {}),
       alias: prepared.model.alias,

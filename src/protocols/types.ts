@@ -1,4 +1,4 @@
-import type { Capability, ChatRequest, FinishReason, ToolCall, Usage } from '../contract.js'
+import type { Capability, ChatRequest, FinishReason, ThoughtSignature, ToolCall, Usage } from '../contract.js'
 import type { ModelConfig, ProtocolId, ProviderConfig } from '../config/types.js'
 
 export interface Target {
@@ -15,8 +15,8 @@ export interface ParsedResponse {
   text: string
   /** 推理模型的思考内容（DeepSeek reasoning_content / Anthropic thinking） */
   reasoning?: string
-  /** 文本 part 的 Gemini 思考签名（其他协议不产生） */
-  thoughtSignature?: string
+  /** Gemini 思考签名集合（其他协议不产生） */
+  thoughtSignatures?: ThoughtSignature[]
   toolCalls?: ToolCall[]
   finishReason?: FinishReason
   usage?: Usage
@@ -25,9 +25,9 @@ export interface ParsedResponse {
 export type ParsedStreamEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'reasoning_delta'; text: string }
-  | { type: 'tool_call_delta'; index: number; id?: string; name?: string; argumentsDelta?: string; thoughtSignature?: string }
-  /** 文本 part 的思考签名（Gemini）；可能在文本 delta 前后任意时刻到达 */
-  | { type: 'thought_signature'; signature: string }
+  | { type: 'tool_call_delta'; index: number; id?: string; name?: string; argumentsDelta?: string }
+  /** Gemini 思考签名（文本 part 或 functionCall part）；可能在任意时刻到达 */
+  | ({ type: 'thought_signature' } & ThoughtSignature)
   | { type: 'usage'; usage: Usage }
   | { type: 'finish'; reason?: FinishReason }
 

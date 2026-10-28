@@ -72,14 +72,34 @@ function checkContent(content: MessageContent | undefined, where: string, allowE
   if (!allowEmpty && !textOfContent(content).trim() && content.length === 0) bad(`${where} 不能为空`)
 }
 
+/** Gemini 思考签名的形状校验：调用方原样回传，插件只确认字段类型没被弄坏 */
+function checkThoughtSignature(item: unknown, where: string): void {
+  if (!isRecord(item)) bad(`${where} 必须是对象`)
+  if (typeof item['signature'] !== 'string' || !item['signature']) bad(`${where}.signature 必填`)
+  if (typeof item['part_index'] !== 'number' || !Number.isInteger(item['part_index']) || item['part_index'] < 0) {
+    bad(`${where}.part_index 必须是非负整数`)
+  }
+  if (item['part_kind'] !== 'text' && item['part_kind'] !== 'function_call') {
+    bad(`${where}.part_kind 只能是 text / function_call`)
+  }
+  for (const key of ['tool_call_id', 'tool_name'] as const) {
+    if (item[key] !== undefined && typeof item[key] !== 'string') bad(`${where}.${key} 必须是字符串`)
+  }
+  if (item['tool_call_index'] !== undefined
+    && (typeof item['tool_call_index'] !== 'number' || !Number.isInteger(item['tool_call_index']) || item['tool_call_index'] < 0)) {
+    bad(`${where}.tool_call_index 必须是非负整数`)
+  }
+}
+
 function checkMessage(message: ChatMessage, index: number): void {
   const where = `messages[${index}]`
   if (!isRecord(message)) bad(`${where} 必须是对象`)
   if (!ROLES.has(message.role)) bad(`${where}.role 不合法`)
   if (message.reasoning !== undefined && typeof message.reasoning !== 'string') bad(`${where}.reasoning 必须是字符串`)
-  // Gemini 思考签名：调用方原样回传，这里只校验类型（其他协议忽略）
-  if (message.thought_signature !== undefined && typeof message.thought_signature !== 'string') {
-    bad(`${where}.thought_signature 必须是字符串`)
+  // Gemini 思考签名：调用方原样回传，这里只校验形状（其他协议忽略）
+  if (message.thought_signatures !== undefined) {
+    if (!Array.isArray(message.thought_signatures)) bad(`${where}.thought_signatures 必须是数组`)
+    message.thought_signatures.forEach((item, i) => checkThoughtSignature(item, `${where}.thought_signatures[${i}]`))
   }
 
   if (message.role === 'system' || message.role === 'user') {
@@ -100,9 +120,6 @@ function checkMessage(message: ChatMessage, index: number): void {
     if (!call.name) bad(`${where}.tool_calls[${i}].name 必填`)
     if (typeof call.arguments !== 'string') bad(`${where}.tool_calls[${i}].arguments 必须是字符串`)
     checkArguments(call.arguments, `${where}.tool_calls[${i}]`)
-    if (call.thought_signature !== undefined && typeof call.thought_signature !== 'string') {
-      bad(`${where}.tool_calls[${i}].thought_signature 必须是字符串`)
-    }
   }
 }
 
