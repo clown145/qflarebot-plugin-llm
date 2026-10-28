@@ -208,10 +208,12 @@ export function normalizeDraft(value: unknown): AppConfigDraft {
     const p = item && typeof item === 'object' ? (item as Record<string, unknown>) : {}
     const apiKey = text(p['api_key'])
     const rawProtocol = p['protocol']
-    if (rawProtocol !== undefined && rawProtocol !== 'openai' && rawProtocol !== 'anthropic') {
+    if (rawProtocol !== undefined && rawProtocol !== 'openai' && rawProtocol !== 'anthropic' && rawProtocol !== 'gemini') {
       throw new Error(`第 ${index + 1} 个供应商的协议不支持：${String(rawProtocol)}`)
     }
-    const protocol: ProtocolId = rawProtocol === 'anthropic' ? 'anthropic' : 'openai'
+    const protocol: ProtocolId = rawProtocol === 'anthropic' || rawProtocol === 'gemini'
+      ? (rawProtocol as ProtocolId)
+      : 'openai'
     const timeout = numberOrUndefined(p['timeout_ms'])
     const headers = headersOf(p['headers'])
     return {

@@ -143,9 +143,9 @@ describe('导入后的 Key 状态', () => {
 
   it('不支持的协议直接报错，不再静默当成 openai', () => {
     expect(() => imported([{
-      id: 'gemini',
-      name: 'Gemini',
-      protocol: 'gemini',
+      id: 'cohere',
+      name: 'Cohere',
+      protocol: 'cohere',
       base_url: 'https://api.test/v1',
       enabled: true,
     }])).toThrow(/协议不支持/)

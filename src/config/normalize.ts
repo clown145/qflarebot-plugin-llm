@@ -31,7 +31,9 @@ const MODEL_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,39}$/
 
 export function normalizeProvider(raw: unknown, index: number): ProviderConfig {
   const item = isRecord(raw) ? raw : {}
-  const protocol: ProtocolId = item['protocol'] === 'anthropic' ? 'anthropic' : 'openai'
+  const protocol: ProtocolId = item['protocol'] === 'anthropic' || item['protocol'] === 'gemini'
+    ? (item['protocol'] as ProtocolId)
+    : 'openai'
   const id = text(item['id'])
   const baseUrl = text(item['base_url']).replace(/\/+$/, '')
   const apiKey = text(item['api_key'])

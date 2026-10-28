@@ -107,17 +107,18 @@ export function openModelDialog(options: ModelDialogOptions): void {
 
   function renderCaps(): void {
     const protocol = protocolOf()
-    if (protocol !== 'openai') caps.delete('json')
+    // JSON 输出：OpenAI（response_format）与 Gemini（response_mime_type）都支持；Anthropic 不支持
+    if (protocol === 'anthropic') caps.delete('json')
     caps.add('text')
     capBox.replaceChildren()
     for (const capability of CAPABILITY_VALUES) {
-      const disabled = capability === 'text' || (capability === 'json' && protocol !== 'openai')
+      const disabled = capability === 'text' || (capability === 'json' && protocol === 'anthropic')
       const chip = h('button', {
         class: `chip${caps.has(capability) ? ' active' : ''}`,
         type: 'button',
         text: LABELS[capability],
         disabled,
-        title: capability === 'json' && protocol !== 'openai' ? '仅 OpenAI 兼容协议可用' : undefined,
+        title: capability === 'json' && protocol === 'anthropic' ? 'Anthropic 协议不支持 JSON 输出' : undefined,
       })
       if (!disabled) {
         chip.addEventListener('click', () => {
@@ -324,7 +325,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
         { class: 'field', style: 'margin-top:12px' },
         h('label', { text: '能力' }),
         capBox,
-        h('span', { class: 'desc', text: '点击切换；JSON 仅 OpenAI 兼容协议可用。' }),
+        h('span', { class: 'desc', text: '点击切换；JSON 输出在 Anthropic 协议下不可用。' }),
       ),
       h(
         'details',

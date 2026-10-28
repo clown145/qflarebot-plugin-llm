@@ -79,7 +79,7 @@ describe('页面与元信息', () => {
   it('/api/meta 返回协议与限制', async () => {
     const response = await call('/api/meta', 'GET')
     const body = (await response.json()) as { protocols: Array<{ id: string }>; limits: { timeout_max: number } }
-    expect(body.protocols.map((item) => item.id)).toEqual(['openai', 'anthropic'])
+    expect(body.protocols.map((item) => item.id)).toEqual(['openai', 'anthropic', 'gemini'])
     expect(body.limits.timeout_max).toBe(28000)
   })
 })
@@ -122,7 +122,7 @@ describe('配置读写', () => {
       body: {
         version: 1,
         config: {
-          providers: [{ id: 'g', name: 'G', protocol: 'gemini', base_url: 'https://api.test/v1', enabled: true }],
+          providers: [{ id: 'g', name: 'G', protocol: 'cohere', base_url: 'https://api.test/v1', enabled: true }],
           models: [],
           default_model: '',
           request_timeout_ms: 25000,
@@ -271,7 +271,7 @@ describe('测试与模型发现', () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
     const response = await call('/api/upstream-models', 'POST', {
-      body: { provider: { id: 'g', protocol: 'gemini', base_url: 'https://api.test/v1', enabled: true } },
+      body: { provider: { id: 'g', protocol: 'cohere', base_url: 'https://api.test/v1', enabled: true } },
     })
     expect(response.status).toBe(400)
     expect(fetchMock).not.toHaveBeenCalled()

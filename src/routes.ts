@@ -62,7 +62,7 @@ function configInput(value: unknown): PublicConfigInput {
 
 function ensureProtocol(provider: Record<string, unknown>, label: string): void {
   const protocol = provider['protocol']
-  if (protocol !== undefined && protocol !== 'openai' && protocol !== 'anthropic') {
+  if (protocol !== undefined && protocol !== 'openai' && protocol !== 'anthropic' && protocol !== 'gemini') {
     throw new HttpError(400, `${label}的协议不支持：${String(protocol)}`)
   }
 }

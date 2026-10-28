@@ -26,6 +26,13 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     description: 'Claude 系列，Messages API',
   },
   {
+    slug: 'gemini',
+    name: 'Google Gemini',
+    protocol: 'gemini',
+    base_url: 'https://generativelanguage.googleapis.com/v1beta',
+    description: 'Gemini 系列，原生 generateContent 协议（思考内容、多模态、工具）',
+  },
+  {
     slug: 'deepseek',
     name: 'DeepSeek',
     protocol: 'openai',

@@ -181,7 +181,7 @@ export function validateConfig(config: StoredConfig): ConfigIssue[] {
     if (!provider.name.trim()) issues.push(issue('error', `${base}.name`, '必填'))
     else if (provider.name.length > 60) issues.push(issue('error', `${base}.name`, '最多 60 个字符'))
 
-    if (provider.protocol !== 'openai' && provider.protocol !== 'anthropic') {
+    if (provider.protocol !== 'openai' && provider.protocol !== 'anthropic' && provider.protocol !== 'gemini') {
       issues.push(issue('error', `${base}.protocol`, '不支持的协议'))
     }
     checkBaseUrl(provider.base_url, `${base}.base_url`, issues)

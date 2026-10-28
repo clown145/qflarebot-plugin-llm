@@ -1,12 +1,14 @@
 import type { ProtocolId, ProtocolMeta } from '../config/types.js'
 import { LLMError } from '../errors.js'
 import { anthropic } from './anthropic.js'
+import { gemini } from './gemini.js'
 import { openai } from './openai.js'
 import type { ProtocolAdapter } from './types.js'
 
 const ADAPTERS: Record<ProtocolId, ProtocolAdapter> = {
   openai,
   anthropic,
+  gemini,
 }
 
 export function adapterFor(protocol: ProtocolId): ProtocolAdapter {

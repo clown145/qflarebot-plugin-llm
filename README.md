@@ -241,12 +241,13 @@ if (result.tool_calls?.length) {
 | --- | --- | --- | --- | --- |
 | `openai` | OpenAI Chat Completions 兼容接口，包括 DeepSeek、Moonshot、智谱、Qwen、SiliconFlow、OpenRouter 等 | 支持 | 支持 | 图片、音频 |
 | `anthropic` | Anthropic Messages | 支持 | 不支持 | 图片、文件 |
+| `gemini` | Google Gemini 原生 generateContent（generativelanguage 或兼容网关） | 支持 | 支持 | 图片、音频、文件 |
 
-`base_url` 填写到 `/v1` 层级，适配器会拼接 `/chat/completions` 或 `/messages`；已包含具体端点的地址也可识别。
+`base_url` 填写到 `/v1`（OpenAI/Anthropic）或 `/v1beta`（Gemini）层级，适配器会拼接端点；已包含具体端点的地址也可识别。
 
-配置页内置的供应商模板有 OpenAI、Anthropic、DeepSeek、OpenRouter、Moonshot、智谱 GLM、阿里云百炼、硅基流动，以及两个「自定义」模板。Ollama、Gemini 兼容端点等其它服务用「自定义 OpenAI 兼容」填地址即可。
+配置页内置的供应商模板有 OpenAI、Anthropic、Google Gemini、DeepSeek、OpenRouter、Moonshot、智谱 GLM、阿里云百炼、硅基流动，以及两个「自定义」模板。Ollama 等其它服务用「自定义 OpenAI 兼容」填地址即可。
 
-原生 Gemini、Azure OpenAI 和 OpenAI Responses 尚未实现，可通过新增协议适配器扩展。
+原生 Azure OpenAI 和 OpenAI Responses 尚未实现，可通过新增协议适配器扩展。
 
 ## 限制
 
@@ -324,7 +325,7 @@ scripts/
 
 ## 致谢
 
-协议字段映射参考了 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 provider 与工具抽象。AstrBot 使用 AGPL-3.0，本插件使用 MIT，协议实现为独立编写。
+协议字段映射参考了 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 provider 与工具抽象（含 Gemini 适配的转换行为）。AstrBot 使用 AGPL-3.0，本插件使用 MIT，协议实现为独立编写。
 
 ## 许可证
 

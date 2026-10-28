@@ -101,6 +101,7 @@ function toMetadata(id: string, value: Record<string, unknown>): ModelMetadata {
 const HOST_PROVIDERS: ReadonlyArray<readonly [string, string]> = [
   ['api.openai.com', 'openai'],
   ['api.anthropic.com', 'anthropic'],
+  ['generativelanguage.googleapis.com', 'google'],
   ['api.deepseek.com', 'deepseek'],
   ['openrouter.ai', 'openrouter'],
   ['api.moonshot.cn', 'moonshotai'],

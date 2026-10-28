@@ -33,7 +33,7 @@ export function pickProviderPreset(): Promise<ProviderPreset | null> {
         const button = h(
           'button',
           { class: 'preset', type: 'button' },
-          h('span', { class: 'preset-head' }, h('span', { class: 'preset-name', text: preset.name }), badge(preset.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容', '')),
+          h('span', { class: 'preset-head' }, h('span', { class: 'preset-name', text: preset.name }), badge(preset.protocol === 'anthropic' ? 'Anthropic' : preset.protocol === 'gemini' ? 'Gemini' : 'OpenAI 兼容', '')),
           h('span', { class: 'small muted', text: preset.description }),
           h('span', { class: 'preset-url mono small', text: preset.base_url || '创建后填写接口地址' }),
         )

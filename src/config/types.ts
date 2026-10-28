@@ -2,7 +2,7 @@
 
 import type { Capability } from '../contract.js'
 
-export type ProtocolId = 'openai' | 'anthropic'
+export type ProtocolId = 'openai' | 'anthropic' | 'gemini'
 
 export interface ProviderConfig {
   /** 页面生成的稳定标识；模型别名靠它引用供应商 */
@@ -117,6 +117,7 @@ export const LIMITS = {
 export const CAPABILITIES: Record<ProtocolId, Capability[]> = {
   openai: ['text', 'tools', 'json'],
   anthropic: ['text', 'tools'],
+  gemini: ['text', 'tools', 'json'],
 }
 
 /** 面板和校验共用；顺序也是面板上的显示顺序 */
