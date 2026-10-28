@@ -321,6 +321,30 @@ describe('密钥不会被发往请求体指定的新地址', () => {
     expect(seenHeaders(fetchMock)['authorization']).toBeUndefined()
   })
 
+  it('/api/upstream-models 拒绝 http 明文地址（不发起请求不带走 Key）', async () => {
+    const ctx = await seeded()
+    const fetchMock = fetchRecorder()
+    vi.stubGlobal('fetch', fetchMock)
+    const response = await call('/api/upstream-models', 'POST', {
+      ctx,
+      body: { provider: { id: 'p', protocol: 'openai', base_url: 'http://attacker.example/v1', enabled: true } },
+    })
+    expect(response.status).toBe(400)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('/api/upstream-models 拒绝回环/内网地址', async () => {
+    const ctx = await seeded()
+    const fetchMock = fetchRecorder()
+    vi.stubGlobal('fetch', fetchMock)
+    const response = await call('/api/upstream-models', 'POST', {
+      ctx,
+      body: { provider: { id: 'p', protocol: 'openai', base_url: 'http://127.0.0.1:8000/v1', enabled: true } },
+    })
+    expect(response.status).toBe(400)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('/api/upstream-models 地址没变仍然沿用已存 Key', async () => {
     const ctx = await seeded()
     const fetchMock = fetchRecorder()
@@ -459,5 +483,34 @@ describe('并发保存', () => {
     expect(response.status).toBe(200)
     const stored = (await ctx.kv.getJSON(CONFIG_KEY)) as StoredConfig
     expect(stored.version).toBe(2)
+  })
+
+  it('写前复查读失败返回 503 而不是 409（不能误导用户刷新丢编辑）', async () => {
+    const base = await seeded()
+    // 首次读正常（乐观检查通过），写前复查那一次读失败
+    const originalGet = base.kv.get.bind(base.kv)
+    let reads = 0
+    const kv = {
+      ...base.kv,
+      get: async (key: string) => {
+        reads += 1
+        if (reads >= 2) throw new Error('kv down')
+        return originalGet(key)
+      },
+    }
+    const ctx = { ...base, kv } as typeof base
+    const response = await call('/api/config', 'PUT', {
+      ctx,
+      body: {
+        version: 1,
+        config: { providers: [], models: [], default_model: '', request_timeout_ms: 15000, max_retries: 1 },
+      },
+    })
+    expect(response.status).toBe(503)
+    const body = (await response.json()) as { error: string }
+    expect(body.error).toBe(CONFIG_READ_FAILED)
+    // KV 里的配置未被触碰（用原始 get 验证，绕过会抛错的 mock）
+    const stored = (await originalGet(CONFIG_KEY)) as string
+    expect((JSON.parse(stored) as StoredConfig).version).toBe(1)
   })
 })

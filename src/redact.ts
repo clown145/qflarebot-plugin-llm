@@ -32,11 +32,40 @@ const CONTEXT_PATTERNS: ReadonlyArray<{ pattern: RegExp; mask: string }> = [
   { pattern: /(\b(?:api[_-]?key|access[_-]?token|secret[_-]?key)["'\s:=]+)[A-Za-z0-9._~+/=-]{8,}/gi, mask: '$1***' },
 ]
 
+/**
+ * 精确值替换：大小写不敏感 + 追加 URL 编码变体。
+ *
+ * 上游偶尔会把 key 大写化（`SK-ABC…`）或 URL 编码（`sk%2Dabc…`）后回显进错误消息，
+ * split/join 的精确匹配与区分大小写的形态模式都命中不了。
+ */
+function replaceExact(text: string, secret: string): string {
+  let out = text.split(secret).join('***')
+  const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  // 大小写不敏感的兜底（可能覆盖精确替换已命中的位置，但结果一样是 ***）
+  out = out.replace(new RegExp(escaped, 'gi'), '***')
+  // URL 编码变体：编码后常见差异是 - → %2D、/ → %2F、+ → %2B。
+  // encodeURIComponent 不动这些「未保留字符」，所以手动构造可能被网关编码的形态
+  for (const encoded of urlEncodedVariants(secret)) {
+    out = out.split(encoded).join('***')
+  }
+  return out
+}
+
+/** 密钥可能被上游 URL 编码的形态：整体编码 + 只编码 -/+// 三种常见差异字符 */
+function urlEncodedVariants(secret: string): string[] {
+  const variants = new Set<string>()
+  const full = encodeURIComponent(secret)
+  if (full !== secret) variants.add(full)
+  const partial = secret.replace(/[-+/]/g, (ch) => ({ '-': '%2D', '/': '%2F', '+': '%2B' })[ch] ?? ch)
+  if (partial !== secret) variants.add(partial)
+  return [...variants]
+}
+
 /** 把文本里的密钥替换成 `***`；不传 secret 时只做模式匹配 */
 export function redact(text: string, secret?: string): string {
   if (!text) return text
   let out = text
-  if (secret && secret.length >= MIN_SECRET_LENGTH) out = out.split(secret).join('***')
+  if (secret && secret.length >= MIN_SECRET_LENGTH) out = replaceExact(out, secret)
   for (const pattern of CREDENTIAL_PATTERNS) {
     pattern.lastIndex = 0
     out = out.replace(pattern, '***')
@@ -48,10 +77,18 @@ export function redact(text: string, secret?: string): string {
   return out
 }
 
-/** 一次脱敏多个密钥（例如同时持有多个供应商的 key） */
+/**
+ * 一次脱敏多个密钥（例如同时持有多个供应商的 key）。
+ * 长度降序：互为前缀时先替换长的，否则短密钥会把长密钥切成 `***bbbb` 的残段。
+ * 没有可用密钥时也跑一遍纯模式匹配——上游回显的凭据不一定属于本插件配置。
+ */
 export function redactAll(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const sorted = secrets
+    .filter((secret): secret is string => typeof secret === 'string' && secret.length >= MIN_SECRET_LENGTH)
+    .sort((a, b) => b.length - a.length)
   let out = text
-  for (const secret of secrets) out = redact(out, secret)
+  for (const secret of sorted) out = redact(out, secret)
+  if (sorted.length === 0) out = redact(out)
   return out
 }
 

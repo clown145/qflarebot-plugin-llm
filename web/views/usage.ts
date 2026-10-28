@@ -86,7 +86,7 @@ if (res.tool_calls?.length) {
         { class: 'issue-list', style: 'margin-top:8px' },
         h('li', { class: 'small muted', text: '支持 OpenAI 兼容（Chat Completions）与 Anthropic Messages。' }),
         h('li', { class: 'small muted', text: '工具调用：OpenAI tool_calls / Anthropic tool_use、tool_result 已归一化。' }),
-        h('li', { class: 'small muted', text: '单次调用默认 25 秒，硬上限 28 秒；一次事件总共 30 秒，工具循环请自己控制预算。' }),
+        h('li', { class: 'small muted', text: '单次调用默认 15 秒，实际生效上限 20 秒（配置里可填到 28 秒但会被压到 20）；一次事件总共 30 秒，工具循环请自己控制预算。' }),
         h('li', { class: 'small muted', text: 'API Key 只存在插件 KV，调用方拿不到；调用方只能选模型别名。' }),
         h('li', { class: 'small muted', text: '服务不保存会话，也不做重试之外的排队、限流或计费。' }),
       ),

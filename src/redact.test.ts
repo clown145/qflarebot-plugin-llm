@@ -27,6 +27,19 @@ describe('redact', () => {
     expect(redact(text)).toBe(redact(text))
     expect(redact(text)).toBe('*** and ***')
   })
+
+  it('上游把 key 大写化后回显也能命中（大小写不敏感兜底）', () => {
+    expect(redact('failed for SK-REAL-SECRET', 'sk-REAL-SECRET')).toBe('failed for ***')
+  })
+
+  it('URL 编码变体（- → %2D 等）也能命中', () => {
+    expect(redact('failed for sk%2DREAL%2DSECRET', 'sk-REAL-SECRET')).toBe('failed for ***')
+  })
+
+  it('互为前缀的多密钥按长度降序替换，不产生残段', () => {
+    expect(redactAll('key sk-REAL-SECRET-LONG and sk-REAL-SECRET', ['sk-REAL-SECRET', 'sk-REAL-SECRET-LONG']))
+      .toBe('key *** and ***')
+  })
 })
 
 describe('looksLikeSecret', () => {

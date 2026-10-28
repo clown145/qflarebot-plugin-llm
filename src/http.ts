@@ -53,20 +53,38 @@ export async function readJson(request: Request, maxBytes = 256 * 1024): Promise
   }
 }
 
-/** 读响应体，最多 maxBytes；超出部分直接丢掉，避免上游的错误页/坏流把内存吃满 */
+/**
+ * 读响应体，最多 maxBytes（按字节）。
+ * 超限时不再吞掉整个最后的 chunk——字节级截断：错误消息按上限截掉比整段丢失更诚实，
+ * JSON 解析失败的报错也更接近真实原因（超限 vs 上游真的发了坏 JSON）。
+ * 上游错误页/坏流由此被挡在内存之外。
+ */
 export async function readTextLimited(response: Response, maxBytes: number): Promise<string> {
   if (!response.body) return ''
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let out = ''
   let bytes = 0
+  let over = false
   try {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
+      if (over) {
+        // 已经超限：继续读完（丢弃）以保证流被正常消费，不再累积
+        continue
+      }
+      const room = maxBytes - bytes
+      if (value.byteLength > room) {
+        out += decoder.decode(value.slice(0, room), { stream: true })
+        bytes = maxBytes
+        over = true
+        await reader.cancel().catch(() => {})
+        break
+      }
       bytes += value.byteLength
       out += decoder.decode(value, { stream: true })
-      if (bytes >= maxBytes) {
+      if (bytes === maxBytes) {
         await reader.cancel().catch(() => {})
         break
       }

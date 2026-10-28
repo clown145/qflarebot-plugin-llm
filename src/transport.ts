@@ -63,7 +63,8 @@ export async function fetchJson(built: BuiltRequest, options: TransportOptions):
     const handle = createAbortHandle(remaining, options.signal)
     try {
       const fetchImpl = options.fetch
-      const response = await fetchImpl(built.url, { ...built.init, signal: handle.signal })
+      // redirect:'manual'：跨域 302 不会带走 x-api-key（Anthropic 唯一凭据）/Authorization；3xx 按上游错误处理
+      const response = await fetchImpl(built.url, { ...built.init, signal: handle.signal, redirect: 'manual' })
       if (!response.ok) {
         const error = await upstreamError(response, options.context)
         if (attempt < options.maxRetries && shouldRetryStatus(response.status) && deadline - Date.now() > 1500) {
@@ -116,7 +117,8 @@ export async function openStream(
     let handedOff = false
     try {
       const fetchImpl = options.fetch
-      const response = await fetchImpl(built.url, { ...built.init, signal: handle.signal })
+      // redirect:'manual'：跨域 302 不会带走 x-api-key（Anthropic 唯一凭据）/Authorization；3xx 按上游错误处理
+      const response = await fetchImpl(built.url, { ...built.init, signal: handle.signal, redirect: 'manual' })
       if (!response.ok) {
         const error = await upstreamError(response, options.context)
         if (attempt < options.maxRetries && shouldRetryStatus(response.status) && deadline - Date.now() > 1500) {

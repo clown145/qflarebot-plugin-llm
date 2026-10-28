@@ -6,7 +6,107 @@ const MODEL_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,39}$/
 /** 由适配器按 api_key 生成的鉴权头；用户再写一份只会产生冲突值（实测会拼成 "Bearer a, Bearer b"） */
 const MANAGED_HEADERS = new Set(['authorization', 'proxy-authorization', 'x-api-key', 'api-key', 'host', 'content-length', 'content-type'])
 /** 私网 / 回环 / 元数据地址：密钥不该发到这些地方 */
-const PRIVATE_HOST = /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)$/i
+/** 私网 / 回环 / 元数据地址：密钥不该发到这些地方（IPv6 家族与边角形态由 isPrivateHost 补齐） */
+const PRIVATE_HOST = /^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)$/i
+
+/**
+ * 私网/回环/链路本地/元数据地址判定，按地址族统一数值比对。
+ *
+ * 旧的正则只认 IPv4 点分与裸 `localhost`，IPv6 家族全部漏网：
+ * `https://[::ffff:127.0.0.1]/`（IPv4 映射回环，hostname 规范化为 `[::ffff:7f00:1]`）、
+ * `https://[::ffff:169.254.169.254]/`（映射的云元数据地址）、`[fd00::1]`（ULA）、
+ * `[fe80::1]`（链路本地）、`[::]`（未指定）、尾点 `localhost.`、`0.0.0.1` 全部通过校验。
+ * 这里补上第二层：hostname 带 `[` 按 IPv6 解析成 128 位数值做范围比对（含
+ * `::ffff:0:0/96` 内嵌的 IPv4）；点分四段按 IPv4 数值比对；其余按主机名（剥尾点）判 localhost。
+ * DNS 间接解析（nip.io 等）不在 hostname 静态检查能力内，属已知残留。
+ */
+const IPV4_PRIVATE_BLOCKS: ReadonlyArray<{ start: number; end: number }> = [
+  { start: 0x00000000, end: 0x00ffffff }, // 0.0.0.0/8（未指定/通配绑定，整段拒绝）
+  { start: 0x0a000000, end: 0x0affffff }, // 10.0.0.0/8
+  { start: 0x7f000000, end: 0x7fffffff }, // 127.0.0.0/8（回环）
+  { start: 0xa9fe0000, end: 0xa9feffff }, // 169.254.0.0/16（链路本地/云元数据）
+  { start: 0xac100000, end: 0xac1fffff }, // 172.16.0.0/12
+  { start: 0xc0a80000, end: 0xc0a8ffff }, // 192.168.0.0/16
+]
+
+function ipv4Private(value: number): boolean {
+  return IPV4_PRIVATE_BLOCKS.some(({ start, end }) => value >= start && value <= end)
+}
+
+/** IPv4 点分四段 → 数值；不匹配该形态返回 undefined（交回主机名判定） */
+function ipv4Value(host: string): number | undefined {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
+  if (!match) return undefined
+  let value = 0
+  for (const part of match.slice(1)) {
+    const octet = Number(part)
+    if (octet > 255) return undefined
+    value = value * 256 + octet
+  }
+  return value
+}
+
+/** IPv6 字面量（`[...]` 里的内容）→ 8 组 16 位；无法解析返回 undefined */
+function ipv6Groups(host: string): number[] | undefined {
+  let body = host
+  const zone = body.indexOf('%')
+  if (zone >= 0) body = body.slice(0, zone) // fe80::1%eth0 之类的区域后缀，剥掉再判
+  if (!/^[0-9a-f:.]+$/i.test(body)) return undefined
+  const halves = body.split('::')
+  if (halves.length > 2) return undefined
+  const parseGroups = (text: string): number[] | undefined => {
+    if (!text) return []
+    const parts = text.split(':')
+    const out: number[] = []
+    for (const part of parts) {
+      if (part.includes('.')) {
+        // 内嵌 IPv4（::ffff:127.0.0.1）：折成两组
+        const v4 = ipv4Value(part)
+        if (v4 === undefined) return undefined
+        out.push(v4 >>> 16, v4 & 0xffff)
+        continue
+      }
+      if (!/^[0-9a-f]{1,4}$/i.test(part)) return undefined
+      out.push(Number.parseInt(part, 16))
+    }
+    return out
+  }
+  const head = parseGroups(halves[0] ?? '')
+  if (head === undefined) return undefined
+  let tail: number[] | undefined = []
+  if (halves.length === 2) {
+    tail = parseGroups(halves[1] ?? '')
+    if (tail === undefined) return undefined
+  } else if (head.length !== 8) {
+    return undefined
+  }
+  const fill = 8 - head.length - tail.length
+  if (fill < 0) return undefined
+  return [...head, ...new Array<number>(fill).fill(0), ...tail]
+}
+
+/** hostname（URL 解析后的原样值，IPv6 带方括号）是否私网/回环/链路本地/未指定 */
+export function isPrivateHost(hostname: string): boolean {
+  if (hostname.startsWith('[')) {
+    if (!hostname.endsWith(']')) return true // 残缺方括号宁可拒绝
+    const groups = ipv6Groups(hostname.slice(1, -1))
+    if (!groups || groups.length !== 8) return true // 解析不了的 IPv6 字面量宁可拒绝
+    // ::ffff:0:0/96 的 IPv4 映射地址：按内嵌 IPv4 判
+    if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
+      const v4 = ((groups[6]! << 16) | groups[7]!) >>> 0
+      return ipv4Private(v4)
+    }
+    const allZero = groups.every((g) => g === 0)
+    const loopback = allZero || (groups[0] === 0 && groups.slice(1, 7).every((g) => g === 0) && groups[7] === 1)
+    const ula = (groups[0]! & 0xfe00) === 0xfc00 // fc00::/7（含 fd00::/8 ULA）
+    const linkLocal = (groups[0]! & 0xffc0) === 0xfe80 // fe80::/10
+    return loopback || ula || linkLocal
+  }
+  const v4 = ipv4Value(hostname)
+  if (v4 !== undefined) return ipv4Private(v4)
+  const host = hostname.replace(/\.$/, '').toLowerCase() // 尾点 FQDN（localhost.）
+  return host === 'localhost'
+}
 const MAX_CONTEXT_WINDOW = 10_000_000
 const MAX_OUTPUT_TOKENS = 1_000_000
 
@@ -25,7 +125,8 @@ function checkTimeout(value: number, path: string, issues: ConfigIssue[]): void 
   }
 }
 
-function checkBaseUrl(value: string, path: string, issues: ConfigIssue[]): void {
+/** 校验上游接口地址：必须 https，且不能是回环/内网主机。供保存路径与 /api/upstream-models、/api/test 复用 */
+export function checkBaseUrl(value: string, path: string, issues: ConfigIssue[]): void {
   if (!value) {
     issues.push(issue('error', path, '必填'))
     return
@@ -49,7 +150,7 @@ function checkBaseUrl(value: string, path: string, issues: ConfigIssue[]): void 
   if (url.username || url.password) {
     issues.push(issue('error', path, '不要在接口地址里写用户名/密码；密钥请放到 API Key 字段'))
   }
-  if (PRIVATE_HOST.test(url.hostname)) {
+  if (PRIVATE_HOST.test(url.hostname) || isPrivateHost(url.hostname)) {
     issues.push(issue('error', path, '不能是回环或内网地址；API Key 会被发到内网服务'))
   }
 }

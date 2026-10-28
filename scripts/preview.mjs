@@ -162,12 +162,19 @@ const server = createServer(async (req, res) => {
   else if (pathname === '/p/llm') pathname = '/'
 
   if (pathname === '/bridge.js') {
-    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' })
+    // 页面带 CSP sandbox 是 opaque origin，跨源加载 ES 模块需要 ACAO（与线上 runtime 返回 ACAO:* 一致）
+    res.writeHead(200, {
+      'content-type': 'text/javascript; charset=utf-8',
+      'access-control-allow-origin': '*',
+    })
     res.end(bridge)
     return
   }
   if (pathname === '/tokens.css') {
-    res.writeHead(200, { 'content-type': 'text/css; charset=utf-8' })
+    res.writeHead(200, {
+      'content-type': 'text/css; charset=utf-8',
+      'access-control-allow-origin': '*',
+    })
     res.end(tokens)
     return
   }

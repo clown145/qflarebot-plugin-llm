@@ -151,8 +151,13 @@ export class LLM implements LLMService {
     }
 
     try {
-      // 把 api_key 传给适配器：流内 error 事件的 message 需要脱敏
-      for await (const event of prepared.adapter.parseStream(body, { apiKey: prepared.provider.api_key })) {
+      // 把凭据传给适配器：流内 error 事件的 message 需要脱敏。
+      // 自定义请求头里可能放凭据（如 Azure 的 api-key），与非流式路径的 upstreamContext 同标准
+      const headerSecrets = Object.values(prepared.provider.headers ?? {}).filter((value): value is string => typeof value === 'string' && value.length > 0)
+      for await (const event of prepared.adapter.parseStream(body, {
+        ...(prepared.provider.api_key ? { apiKey: prepared.provider.api_key } : {}),
+        ...(headerSecrets.length ? { secrets: headerSecrets } : {}),
+      })) {
         if (event.type === 'text_delta') {
           count(event.text)
           text += event.text
@@ -354,11 +359,14 @@ export class LLM implements LLMService {
   }
 
   private upstreamContext(prepared: Prepared): UpstreamContext {
+    // 自定义请求头里可能放凭据（如 Azure 的 api-key）；一并加入脱敏列表，避免上游回显时泄漏
+    const headerSecrets = Object.entries(prepared.provider.headers ?? {}).map(([, value]) => value).filter((v): v is string => typeof v === 'string' && v.length > 0)
     return {
       provider: prepared.provider.id,
       alias: prepared.model.alias,
       timeoutMs: prepared.timeoutMs,
       ...(prepared.provider.api_key ? { apiKey: prepared.provider.api_key } : {}),
+      ...(headerSecrets.length ? { secrets: headerSecrets } : {}),
     }
   }
 

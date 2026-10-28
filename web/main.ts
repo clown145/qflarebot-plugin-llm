@@ -176,7 +176,11 @@ async function reload(): Promise<void> {
 function importConfig(): void {
   const input = h('input', { type: 'file', attrs: { accept: 'application/json,.json' }, style: 'display:none' })
   document.body.append(input)
+  // 用户取消文件选择时 change 不触发，input 会永久残留在 DOM；窗口关闭/失焦时兜底清理
+  const cleanup = () => input.remove()
+  window.addEventListener('focus', cleanup, { once: true })
   input.addEventListener('change', async () => {
+    window.removeEventListener('focus', cleanup)
     const file = input.files?.[0]
     input.remove()
     if (!file) return

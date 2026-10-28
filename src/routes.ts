@@ -1,6 +1,6 @@
 import type { Route, RouteInput } from '@qqbot/sdk'
 import type { ApiError, ConfigGetResponse, ConfigPutResponse, MetaResponse, ModelsResponse, TestResponse } from './apiTypes.js'
-import { hasErrors, LIMITS, mergeSecrets, normalizeProvider, toPublicConfig, validateConfig, droppedSecrets } from './config/index.js'
+import { hasErrors, LIMITS, mergeSecrets, normalizeProvider, toPublicConfig, validateConfig, checkBaseUrl, droppedSecrets } from './config/index.js'
 import type { ConfigIssue, PublicConfigInput, StoredConfig } from './config/types.js'
 import { LLMError, errorMessage } from './errors.js'
 import { createAbortHandle, HttpError, json, readJson, readJsonLimited, readTextLimited, redact, truncate } from './http.js'
@@ -186,11 +186,15 @@ export function createRoutes(): Route[] {
         }
         // 写前再比一次版本：两个并发 PUT 都通过上面的乐观检查时，后写的会覆盖先写的。
         // 这里把「读到 version → 写入」的窗口压到一次 KV 读，冲突时按 409 让页面刷新。
+        // 读失败是 503（README 承诺），不能误导成「配置被修改」让用户刷新丢编辑。
         // 老版本 store 没有 compareAndWrite（测试替身可能没实现）时退回直接写。
-        const wrote = store.compareAndWrite
+        const outcome = store.compareAndWrite
           ? await store.compareAndWrite(next, version)
-          : true
-        if (!wrote) {
+          : (await store.write(next), 'written' as const)
+        if (outcome === 'read-failed') {
+          return json({ ok: false, error: CONFIG_READ_FAILED } satisfies ApiError, 503)
+        }
+        if (outcome !== 'written') {
           const latest = await store.read()
           return json({
             ok: false,
@@ -245,6 +249,12 @@ export function createRoutes(): Route[] {
         const provider = normalizeProvider(raw, 0)
         if (!provider.id) throw new HttpError(400, 'provider.id 必填')
         if (!provider.base_url) throw new HttpError(400, 'provider.base_url 必填')
+        // 与保存路径同一道防线：拒绝 http / 回环 / 内网，避免把密钥发进内网或明文外发
+        {
+          const issues: ConfigIssue[] = []
+          checkBaseUrl(provider.base_url, 'provider.base_url', issues)
+          if (hasErrors(issues)) throw new HttpError(400, issues[0]!.message)
+        }
 
         const current = await createConfigStore(ctx).read()
         if (current.readFailed) throw new HttpError(503, CONFIG_READ_FAILED)
@@ -262,7 +272,7 @@ export function createRoutes(): Route[] {
         try {
           let response: Response
           try {
-            response = await fetch(built.url, { ...built.init, signal: handleAbort.signal })
+            response = await fetch(built.url, { ...built.init, signal: handleAbort.signal, redirect: 'manual' })
           } catch (err) {
             if (handleAbort.timedOut()) throw new HttpError(504, '拉取模型超时（15 秒）')
             throw new HttpError(502, `连接上游失败：${truncate(errorMessage(err), 200)}`)

@@ -20,12 +20,14 @@ export interface ConfigStore {
   /**
    * 写之前再读一次，版本不一致就拒绝写入。
    *
-   * **这不是原子操作**：KV 没有 compare-and-swap，两个请求仍可能同时读到同一版本、
-   * 同时通过检查，后写的覆盖先写的。它能把「读到 version → 写入」的窗口从两次往返
-   * 压到一次 KV 读之前，从而挡住绝大多数跨标签页 / 跨边缘节点的保存冲突；
-   * 真正的串行保证来自页面的保存队列（web/save.ts），以及冲突时按 409 让用户刷新。
+   * 返回 'written' | 'conflict' | 'read-failed'：
+   * - **这不是原子操作**：KV 没有 compare-and-swap，两个请求仍可能同时读到同一版本、
+   *   同时通过检查，后写的覆盖先写的。它能把「读到 version → 写入」的窗口从两次往返
+   *   压到一次 KV 读之前，从而挡住绝大多数跨标签页 / 跨边缘节点的保存冲突；
+   *   真正的串行保证来自页面的保存队列（web/save.ts），以及冲突时按 409 让用户刷新。
+   * - 读失败单独成态：PUT 据此返回 503 而不是误导用户「配置被修改」的 409。
    */
-  compareAndWrite(config: StoredConfig, expectedVersion: number): Promise<boolean>
+  compareAndWrite(config: StoredConfig, expectedVersion: number): Promise<'written' | 'conflict' | 'read-failed'>
 }
 
 type StoreContext = Pick<PluginContext, 'kv' | 'logger'>
@@ -66,10 +68,10 @@ export function createConfigStore(ctx: StoreContext): ConfigStore {
     },
     async compareAndWrite(config, expectedVersion) {
       const current = await this.read()
-      if (current.readFailed) return false
-      if (current.config.version !== expectedVersion) return false
+      if (current.readFailed) return 'read-failed'
+      if (current.config.version !== expectedVersion) return 'conflict'
       await ctx.kv.put(CONFIG_KEY, config)
-      return true
+      return 'written'
     },
   }
 }
@@ -98,6 +100,6 @@ export function fixedStore(config: StoredConfig): ConfigStore {
   return {
     read: async () => ({ config, corrupt: false }),
     write: async () => {},
-    compareAndWrite: async () => true,
+    compareAndWrite: async () => 'written',
   }
 }

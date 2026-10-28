@@ -109,6 +109,36 @@ describe('anthropic.buildChat', () => {
     ])
   })
 
+  it('data: URI 的图片拆回 base64 source（url source 只接受 https，原样透传必 400）', () => {
+    const built = anthropic.buildChat(target, {
+      messages: [{ role: 'user', content: [{ type: 'image', url: 'data:image/png;base64,AAAA' }] }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content).toEqual([
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+    ])
+  })
+
+  it('file 片段的 filename 落到 document 的 title；data URI 文件同样拆回 base64', () => {
+    const built = anthropic.buildChat(target, {
+      messages: [{ role: 'user', content: [{ type: 'file', url: 'data:application/pdf;base64,AAEC', filename: 'notes.pdf' }] }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content).toEqual([
+      { type: 'document', title: 'notes.pdf', source: { type: 'base64', media_type: 'application/pdf', data: 'AAEC' } },
+    ])
+  })
+
+  it('https url 原样透传为 url source，不受 data URI 拆解影响', () => {
+    const built = anthropic.buildChat(target, {
+      messages: [{ role: 'user', content: [{ type: 'image', url: 'https://x.test/cat.png' }] }],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].content).toEqual([
+      { type: 'image', source: { type: 'url', url: 'https://x.test/cat.png' } },
+    ])
+  })
+
   it('工具定义、tool_use 与 tool_result 的映射', () => {
     const built = anthropic.buildChat(target, {
       messages: [

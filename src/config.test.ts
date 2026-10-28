@@ -4,7 +4,7 @@ import { normalizeConfig } from './config/normalize.js'
 import { resolveTarget } from './config/resolve.js'
 import { mergeSecrets, toPublicConfig } from './config/secrets.js'
 import type { StoredConfig } from './config/types.js'
-import { validateConfig } from './config/validate.js'
+import { validateConfig, isPrivateHost, checkBaseUrl } from './config/validate.js'
 
 function sample(): StoredConfig {
   const config = createDefaultConfig()
@@ -86,6 +86,23 @@ describe('toPublicConfig / mergeSecrets', () => {
     const cleared = mergeSecrets({ ...toPublicConfig(current), providers: [{ ...toPublicConfig(current).providers[0]!, api_key: null }] }, current)
     expect(cleared.providers[0]?.api_key).toBeUndefined()
   })
+
+  it('提交 id 带空白时清除/替换意图不被静默丢弃（id 按 trim 后匹配）', () => {
+    const current = sample()
+    const view = toPublicConfig(current)
+    // 直接调 API 的调用方可能传未 trim 的 id；normalize 后 provider.id 是 'deepseek'
+    const cleared = mergeSecrets(
+      { ...view, providers: [{ ...view.providers[0]!, id: ' deepseek ', api_key: null }] },
+      current,
+    )
+    expect(cleared.providers[0]?.api_key).toBeUndefined()
+
+    const replaced = mergeSecrets(
+      { ...view, providers: [{ ...view.providers[0]!, id: ' deepseek ', api_key: 'sk-new' }] },
+      current,
+    )
+    expect(replaced.providers[0]?.api_key).toBe('sk-new')
+  })
 })
 
 describe('validateConfig', () => {
@@ -124,6 +141,34 @@ describe('validateConfig', () => {
     expect(errors.some((item) => item.path.endsWith('context_window'))).toBe(true)
     expect(errors.some((item) => item.path.endsWith('max_output_tokens'))).toBe(true)
     expect(errors.some((item) => item.path.endsWith('capabilities'))).toBe(true)
+  })
+})
+
+describe('isPrivateHost / checkBaseUrl', () => {
+  it('拦截 IPv6 家族（映射回环/元数据、ULA、链路本地、未指定）与边角形态', () => {
+    const blocked = [
+      '[::ffff:7f00:1]', '[::ffff:a9fe:a9fe]', '[::ffff:a00:5]', '[::ffff:c0a8:101]',
+      '[fd00::1]', '[fe80::1]', '[::]', '[::1]', 'localhost', 'LOCALHOST', 'localhost.',
+      '127.0.0.1', '10.0.0.5', '192.168.1.1', '169.254.169.254', '172.16.0.1', '172.31.255.255',
+      '0.0.0.0', '0.0.0.1', '[0:0:0:0:0:0:0:1]', '[::ffff:127.0.0.1]', '[fe80::1%25eth0]', '[fd12:3456::]',
+    ]
+    for (const host of blocked) expect(isPrivateHost(host), host).toBe(true)
+  })
+
+  it('放行公网 IPv6/IPv4/域名（含尾点域名与映射公网 IPv4）', () => {
+    const allowed = [
+      '[2606:4700::6810:85e5]', '[2001:db8::1]', '[::ffff:8.8.8.8]', 'api.openai.com',
+      '8.8.8.8', '1.1.1.1', '172.32.0.1', '[64:ff9b::8.8.8.8]', 'example.com.', '[2a01::1]',
+    ]
+    for (const host of allowed) expect(isPrivateHost(host), host).toBe(false)
+  })
+
+  it('checkBaseUrl 对 IPv6 绕过向量报 error', () => {
+    const issues: { level: string; path: string; message: string }[] = []
+    for (const url of ['https://[::ffff:127.0.0.1]/v1', 'https://[::ffff:169.254.169.254]/v1', 'https://[fd00::1]/v1', 'https://localhost./v1', 'https://0.0.0.1/v1']) {
+      checkBaseUrl(url, 'providers.0.base_url', issues as never)
+    }
+    expect(issues.filter((item) => item.level === 'error')).toHaveLength(5)
   })
 })
 

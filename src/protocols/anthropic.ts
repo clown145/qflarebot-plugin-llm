@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatRequest, LLMErrorCode, MessageContent, ToolCall, ToolChoice } from '../contract.js'
+import type { ChatMessage, ChatRequest, MessageContent, ToolCall, ToolChoice } from '../contract.js'
 import type { ProviderConfig } from '../config/types.js'
 import { LLMError } from '../errors.js'
 import { asArray, asNumber, asString, isRecord } from '../json.js'
@@ -68,7 +68,25 @@ function toolInput(argumentsText: string): Record<string, unknown> {
   return value
 }
 
-/** base64 source（`data` + `media_type`）或 url source；两者都没有时抛 bad_request */
+/** 解析 `data:<media_type>;base64,<payload>` 形态的 URI；非该形态返回 undefined */
+function parseDataUri(url: string): { mediaType: string; data: string } | undefined {
+  if (!url.startsWith('data:')) return undefined
+  const comma = url.indexOf(',')
+  if (comma < 0) return undefined
+  const meta = url.slice(5, comma)
+  const payload = url.slice(comma + 1)
+  // 只拆 base64 形态；percent-encoded 的非 base64 data URI 不支持，让调用方改用 data 片段
+  if (!meta.endsWith(';base64')) return undefined
+  const mediaType = meta.slice(0, -';base64'.length) || 'application/octet-stream'
+  if (!/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i.test(mediaType)) return undefined
+  return { mediaType, data: payload }
+}
+
+/**
+ * base64 source（`data` + `media_type`）或 url source；两者都没有时抛 bad_request。
+ * `url` 里的 `data:` URI 会拆回 base64 source——Anthropic 的 url source 只接受 https，
+ * 原样透传会直接 invalid_request_error（OpenAI 端 image_url.url 接受 data URI，两家行为不能分叉）。
+ */
 function mediaSource(part: { url?: string; data?: string; media_type?: string }, where: string): Record<string, unknown> {
   if (part.data) {
     return {
@@ -77,7 +95,17 @@ function mediaSource(part: { url?: string; data?: string; media_type?: string },
       data: part.data,
     }
   }
-  if (part.url) return { type: 'url', url: part.url }
+  if (part.url) {
+    const dataUri = parseDataUri(part.url)
+    if (dataUri) {
+      return {
+        type: 'base64',
+        media_type: part.media_type ?? dataUri.mediaType,
+        data: dataUri.data,
+      }
+    }
+    return { type: 'url', url: part.url }
+  }
   throw new LLMError('bad_request', `${where} 缺少 url 或 data`)
 }
 
@@ -88,7 +116,12 @@ function contentBlocks(content: MessageContent | undefined, where: string): Bloc
   return toParts(content).map((part) => {
     if (part.type === 'text') return { type: 'text', text: part.text }
     if (part.type === 'image') return { type: 'image', source: mediaSource(part, `${where} 的图片片段`) }
-    if (part.type === 'file') return { type: 'document', source: mediaSource(part, `${where} 的文件片段`) }
+    if (part.type === 'file') {
+      // document block 的 title 承载文件名；不传也能工作，传了上游展示更友好
+      const block: Record<string, unknown> = { type: 'document', source: mediaSource(part, `${where} 的文件片段`) }
+      if (part.filename) block['title'] = part.filename
+      return block as unknown as Block
+    }
     throw new LLMError('unsupported', 'Anthropic 协议不支持音频输入')
   })
 }
@@ -240,27 +273,14 @@ function parseResponse(json: unknown): ParsedResponse {
   }
 }
 
-function streamErrorCode(type: string | undefined): LLMErrorCode {
-  switch (type) {
-    case 'authentication_error':
-    case 'permission_error':
-      return 'auth'
-    case 'rate_limit_error':
-      return 'rate_limit'
-    case 'invalid_request_error':
-    case 'not_found_error':
-    case 'request_too_large':
-      return 'bad_request'
-    case 'overloaded_error':
-    case 'api_error':
-      return 'upstream'
-    default:
-      return 'upstream'
-  }
-}
-
 function upstreamOf(ctx: StreamContext | undefined): UpstreamContext {
-  return { provider: '', alias: '', timeoutMs: 0, ...(ctx?.apiKey ? { apiKey: ctx.apiKey } : {}) }
+  return {
+    provider: '',
+    alias: '',
+    timeoutMs: 0,
+    ...(ctx?.apiKey ? { apiKey: ctx.apiKey } : {}),
+    ...(ctx?.secrets?.length ? { secrets: ctx.secrets } : {}),
+  }
 }
 
 async function* parseStream(
@@ -268,6 +288,20 @@ async function* parseStream(
   ctx?: StreamContext,
 ): AsyncGenerator<ParsedStreamEvent> {
   const upstream = upstreamOf(ctx)
+  // Anthropic 的 content block 序号是「文本块/工具块共用」的索引（text 块=0、tool_use 块=1），
+  // 不等于下游 tool_call_delta 的紧凑序号。这里按 block index 映射成连续的工具槽位，
+  // 避免调用方拿 index 当下标累积时错位（contract.ts 中 index 只是分组键）。
+  const toolSlotByBlock = new Map<number, number>()
+  let nextToolSlot = 0
+  const toolSlotFor = (blockIndex: number | undefined): number => {
+    const up = blockIndex ?? 0
+    let s = toolSlotByBlock.get(up)
+    if (s === undefined) {
+      s = nextToolSlot++
+      toolSlotByBlock.set(up, s)
+    }
+    return s
+  }
   for await (const message of readSSE(body)) {
     let json: unknown
     try {
@@ -288,7 +322,7 @@ async function* parseStream(
     if (event === 'content_block_start') {
       const block = isRecord(json['content_block']) ? json['content_block'] : {}
       if (block['type'] === 'tool_use') {
-        const index = asNumber(json['index']) ?? 0
+        const index = toolSlotFor(asNumber(json['index']))
         const id = asString(block['id'])
         const name = asString(block['name'])
         yield { type: 'tool_call_delta', index, ...(id ? { id } : {}), ...(name ? { name } : {}) }
@@ -307,7 +341,7 @@ async function* parseStream(
         if (thinking) yield { type: 'reasoning_delta', text: thinking }
       } else if (delta['type'] === 'input_json_delta') {
         const partial = asString(delta['partial_json'])
-        if (partial) yield { type: 'tool_call_delta', index, argumentsDelta: partial }
+        if (partial) yield { type: 'tool_call_delta', index: toolSlotFor(index), argumentsDelta: partial }
       }
       continue
     }

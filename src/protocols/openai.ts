@@ -191,6 +191,7 @@ function upstreamOf(ctx: StreamContext | undefined, target?: Target): UpstreamCo
     alias: target?.model.alias ?? '',
     timeoutMs: 0,
     ...(ctx?.apiKey ? { apiKey: ctx.apiKey } : {}),
+    ...(ctx?.secrets?.length ? { secrets: ctx.secrets } : {}),
   }
 }
 
@@ -199,8 +200,37 @@ async function* parseStream(
   ctx?: StreamContext,
 ): AsyncGenerator<ParsedStreamEvent> {
   const upstream = upstreamOf(ctx)
+  // 流式工具调用的分组键：标准 OpenAI 会带 index（同一工具的增量段共用同一 index，首段带 id/name）。
+  // 问题出在缺 index 的本地/中转网关：旧实现 ?? 0 让同批并行调用全部塌缩到 0，被下游并成一条。
+  // 这里对缺 index 的增量分配自增槽位；带 index 的按原样透传，保留下游 0–63 的越界检查。
+  const slotByKey = new Map<string, number>()
+  const usedRaw = new Set<number>()
+  let nextSlot = 0
+  let lastSlot = -1
+  const promiseAllocate = (): number => {
+    while (usedRaw.has(nextSlot)) nextSlot++
+    const s = nextSlot++
+    lastSlot = s
+    return s
+  }
+  const slotFor = (upIndex: number | undefined, key: string | undefined): number => {
+    if (upIndex !== undefined) {
+      usedRaw.add(upIndex)
+      lastSlot = upIndex
+      return upIndex
+    }
+    if (key) {
+      let s = slotByKey.get(key)
+      if (s === undefined) { s = promiseAllocate(); slotByKey.set(key, s) }
+      lastSlot = s
+      return s
+    }
+    // 无 index 也无辨识信息（纯参数增量）：并入最近打开的槽位
+    return lastSlot >= 0 ? lastSlot : promiseAllocate()
+  }
   for await (const message of readSSE(body)) {
-    if (message.data === '[DONE]') return
+    // trim：部分代理会给 [DONE] 帧带上尾随空白，严格相等会漏判、落入 JSON.parse 失败
+    if (message.data.trim() === '[DONE]') return
     let json: unknown
     try {
       json = JSON.parse(message.data)
@@ -233,16 +263,19 @@ async function* parseStream(
       for (const item of asArray(delta['tool_calls'])) {
         if (!isRecord(item)) continue
         const fn = isRecord(item['function']) ? item['function'] : {}
-        const index = asNumber(item['index']) ?? 0
+        const upIndex = asNumber(item['index'])
         const id = asString(item['id'])
         const name = asString(fn['name'])
-        const args = asString(fn['arguments'])
+        const inputArgs = asString(fn['arguments'])
+        // 首段带 id/name 时可用它辨识；纯增量段（无 index 无 id/name）并入最近打开的槽位
+        const key = id ? (`id:${id}`) : name ? (`name:${name}`) : undefined
+        const index = slotFor(upIndex, key)
         yield {
           type: 'tool_call_delta',
           index,
           ...(id ? { id } : {}),
           ...(name ? { name } : {}),
-          ...(args ? { argumentsDelta: args } : {}),
+          ...(inputArgs ? { argumentsDelta: inputArgs } : {}),
         }
       }
 

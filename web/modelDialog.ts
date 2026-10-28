@@ -175,8 +175,17 @@ export function openModelDialog(options: ModelDialogOptions): void {
         void toast(`目录里找不到 ${source.value} 下的这个模型`, 'warning')
         return
       }
+      // 用户选来源就是为了覆盖冲突字段：来源缺失的字段清空，而不是残留其他来源的旧值
+      draft.context_window = undefined
+      draft.max_output_tokens = undefined
+      contextWindow.value = ''
+      maxOutput.value = ''
       applyResolution(scoped, true)
-      metaText.textContent = `已按 ${source.value} 覆盖上下文、输出上限和能力，可继续手动调整。`
+      const filled: string[] = []
+      if (draft.context_window !== undefined) filled.push('上下文')
+      if (draft.max_output_tokens !== undefined) filled.push('输出上限')
+      filled.push('能力')
+      metaText.textContent = `已按 ${source.value} 覆盖${filled.join('、')}；该来源没有的字段已清空，可继续手动调整。`
     })
     metaActions.append(source, apply)
   }
@@ -340,10 +349,16 @@ export function openModelDialog(options: ModelDialogOptions): void {
         const save = h('button', { class: 'btn primary', text: '保存并应用', type: 'button' })
         save.addEventListener('click', async () => {
           if (saving) return
-          const nextAlias = alias.value.trim()
+          let nextAlias = alias.value.trim()
           const nextModel = upstream.value.trim()
+          // README 承诺「留空会按模型名自动生成」：手动清空后保存同样回填，
+          // 而不是只在输入上游模型名时实时同步（syncAlias 只在 aliasTouched=false 时跑）
+          if (!nextAlias && nextModel) {
+            nextAlias = uniqueAlias(config.models, aliasBase(nextModel))
+            alias.value = nextAlias
+          }
           if (!nextAlias) {
-            await toast('模型别名不能为空', 'warning')
+            await toast('模型别名不能为空：请填写别名或上游模型名', 'warning')
             return
           }
           if (!ALIAS_PATTERN.test(nextAlias)) {

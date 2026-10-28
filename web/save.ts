@@ -41,6 +41,10 @@ async function put(): Promise<Outcome> {
   try {
     const data = await api.saveConfig({ version: state.version, config: toInput(state.config) })
     applySaved(data)
+    // 服务端在地址/协议变化时会清除旧 Key（dropped_secrets）；页面必须提示重填，否则下次调用 401 无从定位
+    if (data.dropped_secrets && data.dropped_secrets.length) {
+      await toast(`这些供应商的 API Key 因接口地址/协议变化已被清除，请重新填写：${data.dropped_secrets.join('、')}`, 'warning')
+    }
     return 'ok'
   } catch (err) {
     if (err instanceof ApiError && err.status === 409) {

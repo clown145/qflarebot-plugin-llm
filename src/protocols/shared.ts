@@ -1,15 +1,17 @@
 import type { ContentPart, FinishReason, MessageContent, Usage } from '../contract.js'
 import { asNumber, isRecord } from '../json.js'
 
-/** 去掉尾部斜杠；如果用户已经写到了具体端点，就不再重复拼 */
+/** 去掉尾部斜杠；如果用户已经写到了具体端点，就不再重复拼。`?` 与 `#` 之后的部分原样保留 */
 export function endpointUrl(baseUrl: string, endpoint: string): string {
   const base = baseUrl.trim().replace(/\/+$/, '')
   if (base.endsWith(endpoint)) return base
-  const query = base.indexOf('?')
-  if (query >= 0) {
-    const path = base.slice(0, query).replace(/\/+$/, '')
+  // 与 modelsUrl 一致：fragment（#）同 query（?）一样不属于路径，端点要拼在它前面
+  const split = base.search(/[?#]/)
+  if (split >= 0) {
+    const path = base.slice(0, split).replace(/\/+$/, '')
+    const suffix = base.slice(split)
     if (path.endsWith(endpoint)) return base
-    return `${path}${endpoint}${base.slice(query)}`
+    return `${path}${endpoint}${suffix}`
   }
   return `${base}${endpoint}`
 }

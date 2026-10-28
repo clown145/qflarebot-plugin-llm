@@ -22,6 +22,14 @@ describe('endpointUrl', () => {
       'https://api.test/v1/chat/completions?x=1',
     )
   })
+
+  it('fragment（#）与 query 同等对待：端点拼在 # 之前，而不是拼进 fragment', () => {
+    expect(endpointUrl('https://api.test/v1#f', '/chat/completions')).toBe('https://api.test/v1/chat/completions#f')
+    expect(endpointUrl('https://api.test/v1/#f', '/messages')).toBe('https://api.test/v1/messages#f')
+    expect(endpointUrl('https://api.test/v1/chat/completions#f', '/chat/completions')).toBe(
+      'https://api.test/v1/chat/completions#f',
+    )
+  })
 })
 
 describe('modelsUrl', () => {

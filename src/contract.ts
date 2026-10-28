@@ -48,7 +48,11 @@ export interface ChatMessage {
   tool_call_id?: string
   /** tool 消息可标记为错误结果（Anthropic 会转成 is_error） */
   is_error?: boolean
-  /** assistant 消息里的推理内容（DeepSeek reasoning_content / Anthropic thinking），回传可保持上下文 */
+  /**
+   * assistant 消息里的推理内容（DeepSeek reasoning_content / Anthropic thinking）。
+   * 回传不会被读取：上游 thinking 带签名无法重建（见 README「推理内容」），
+   * 该字段只作为调用方本地记录的存在，发给本服务时会被静默忽略。
+   */
   reasoning?: string
 }
 

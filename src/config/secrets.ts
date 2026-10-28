@@ -46,6 +46,9 @@ function normalizeBaseUrl(value: string): string {
  * 页面提交后按 provider id 合并密钥：
  * api_key 字符串=替换、null=清除、省略或空串=保留已存的值（**仅当地址与协议都没变**）。
  * 这样页面改名字、开关时不会把密钥清掉，也不需要把真值发给浏览器；而改地址时不会把旧密钥带过去。
+ *
+ * 注意匹配必须用 trim 后的 id：provider.id 是 normalizeProvider trim 的产物，
+ * 直接调 API 提交 `id:' p '` 时原始 id 对不上，null/新串的意图会被静默丢弃。
  */
 export function mergeSecrets(input: PublicConfigInput, current: StoredConfig, now = new Date()): StoredConfig {
   const next = normalizeConfig(input)
@@ -54,7 +57,7 @@ export function mergeSecrets(input: PublicConfigInput, current: StoredConfig, no
   next.updated_at = now.toISOString()
 
   for (const provider of next.providers) {
-    const submitted = input.providers.find((item) => item?.id === provider.id)
+    const submitted = input.providers.find((item) => item && typeof item.id === 'string' && item.id.trim() === provider.id)
     const existing = current.providers.find((item) => item.id === provider.id)
     if (submitted?.api_key === null) {
       delete provider.api_key
@@ -72,11 +75,13 @@ export function droppedSecrets(input: PublicConfigInput, current: StoredConfig):
   const dropped: string[] = []
   for (const submitted of input.providers) {
     if (!submitted || typeof submitted !== 'object') continue
-    const existing = current.providers.find((item) => item.id === submitted.id)
+    const id = typeof submitted.id === 'string' ? submitted.id.trim() : ''
+    if (!id) continue
+    const existing = current.providers.find((item) => item.id === id)
     if (!existing?.api_key) continue
     const submittedKey = typeof submitted.api_key === 'string' ? submitted.api_key.trim() : ''
     if (submittedKey || submitted.api_key === null) continue
-    if (!canReuseSecret(submitted as { id: string; protocol: string; base_url: string }, existing)) dropped.push(submitted.id)
+    if (!canReuseSecret({ id, protocol: String(submitted.protocol ?? ''), base_url: String(submitted.base_url ?? '') }, existing)) dropped.push(id)
   }
   return dropped
 }

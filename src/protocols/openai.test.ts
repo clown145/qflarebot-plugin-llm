@@ -110,6 +110,14 @@ describe('openai.parseStream', () => {
   it('坏 JSON 会抛错', async () => {
     await expect(events(['data: {oops}\n\n'])).rejects.toThrow(/合法 JSON/)
   })
+
+  it('[DONE] 带尾随空白（部分代理会加）也能正常结束，不落进 JSON 解析', async () => {
+    const out = await events([
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+      'data: [DONE] \n\n',
+    ])
+    expect(out).toEqual([{ type: 'text_delta', text: 'ok' }])
+  })
 })
 
 describe('openai.parseListModels', () => {

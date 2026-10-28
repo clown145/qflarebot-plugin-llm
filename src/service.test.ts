@@ -132,6 +132,27 @@ describe('LLM.stream', () => {
     }
   })
 
+  it('缺 index 的并行工具调用不塌缩成一条', async () => {
+    // 某些本地/中转网关的 stream 增量不带 index；旧实现 ?? 0 让两条并行调用并成一条
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([
+      'data: {"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"lookup","arguments":"{\\"q\\":\\"a\\"}"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"id":"c2","function":{"name":"weather","arguments":"{\\"city\\":\\"b\\"}"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]))
+    const llm = client(fetchMock as unknown as typeof fetch)
+    const events: StreamEvent[] = []
+    for await (const event of llm.stream({ model: 'chat', messages: [{ role: 'user', content: 'x' }] })) events.push(event)
+    const done = events.find((item) => item.type === 'done')
+    expect(done).toBeDefined()
+    if (done?.type === 'done') {
+      expect(done.result.tool_calls).toEqual([
+        { id: 'c1', name: 'lookup', arguments: '{\"q\":\"a\"}' },
+        { id: 'c2', name: 'weather', arguments: '{\"city\":\"b\"}' },
+      ])
+    }
+  })
+
   it('累计内容超过 8 MB 时抛 bad_response', async () => {
     const chunk = 'x'.repeat(900 * 1024)
     const line = `data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}\n\n`
@@ -190,7 +211,7 @@ describe('LLM 其他方法', () => {
     const store: ConfigStore = {
       read: async () => ({ config: createDefaultConfig(), corrupt: true, readFailed: true }),
       write: async () => {},
-      compareAndWrite: async () => true,
+      compareAndWrite: async () => 'written' as const,
     }
     const llm = new LLM({ store, logger })
     await expect(llm.listModels()).rejects.toMatchObject({ code: 'config', message: CONFIG_READ_FAILED })
@@ -242,7 +263,7 @@ describe('LLM 错误语义', () => {
     const store: ConfigStore = {
       read: async () => ({ config: createDefaultConfig(), corrupt: true }),
       write: async () => {},
-      compareAndWrite: async () => true,
+      compareAndWrite: async () => 'written' as const,
     }
     const llm = new LLM({ store, logger })
     await expect(llm.listModels()).rejects.toMatchObject({ code: 'config' })
@@ -270,7 +291,7 @@ describe('LLM 错误语义', () => {
     const store: ConfigStore = {
       read: async () => ({ config: createDefaultConfig(), corrupt: true, readFailed: true }),
       write: async () => {},
-      compareAndWrite: async () => true,
+      compareAndWrite: async () => 'written' as const,
     }
     const llm = new LLM({ store, logger })
     const result = await llm.ping()
