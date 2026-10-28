@@ -261,3 +261,126 @@ describe('gemini.parseListModels / buildListModels', () => {
     expect((built.init.headers as Record<string, string>)['x-goog-api-key']).toBe('g-key')
   })
 })
+
+describe('gemini thoughtSignature（Gemini 2.5/3.x 强制要求回传）', () => {
+  it('非流式：文本 part 的签名进 thoughtSignature，functionCall part 的签名进 tool_call', () => {
+    const parsed = gemini.parseResponse({
+      candidates: [{
+        content: { parts: [
+          { text: '答案', thoughtSignature: 'sig-text' },
+          { function_call: { name: 'lookup', args: { q: 'x' }, id: 'c1' }, thoughtSignature: 'sig-call' },
+        ] },
+        finish_reason: 'STOP',
+      }],
+    })
+    expect(parsed.thoughtSignature).toBe('sig-text')
+    expect(parsed.toolCalls?.[0]?.thought_signature).toBe('sig-call')
+  })
+
+  it('并行 function call：只有第一个带签名时，第二个不会凭空得到签名', () => {
+    const parsed = gemini.parseResponse({
+      candidates: [{
+        content: { parts: [
+          { function_call: { name: 'a', args: {}, id: 'c1' }, thoughtSignature: 'sig-first' },
+          { function_call: { name: 'b', args: {}, id: 'c2' } },
+        ] },
+        finish_reason: 'STOP',
+      }],
+    })
+    expect(parsed.toolCalls).toHaveLength(2)
+    expect(parsed.toolCalls?.[0]?.thought_signature).toBe('sig-first')
+    expect(parsed.toolCalls?.[1]?.thought_signature).toBeUndefined()
+    expect('thought_signature' in (parsed.toolCalls?.[1] ?? {})).toBe(false)
+  })
+
+  it('回传：assistant 消息的 thought_signature 与 tool_calls[].thought_signature 贴回对应 part', () => {
+    const built = gemini.buildChat(target, {
+      messages: [
+        { role: 'user', content: '天气' },
+        {
+          role: 'assistant',
+          content: '让我查一下',
+          thought_signature: 'sig-text',
+          tool_calls: [
+            { id: 'c1', name: 'get_weather', arguments: '{"city":"北京"}', thought_signature: 'sig-call-1' },
+            { id: 'c2', name: 'get_time', arguments: '{}' },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'c1', content: '{"temp":20}' },
+        { role: 'tool', tool_call_id: 'c2', content: '{"now":"12:00"}' },
+      ],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    const modelContent = body.contents.find((item: { role: string }) => item.role === 'model')
+    expect(modelContent.parts).toEqual([
+      { text: '让我查一下', thoughtSignature: 'sig-text' },
+      { function_call: { name: 'get_weather', args: { city: '北京' }, id: 'c1' }, thoughtSignature: 'sig-call-1' },
+      { function_call: { name: 'get_time', args: {}, id: 'c2' } },
+    ])
+  })
+
+  it('没有签名时不注入空字段（避免上游收到 undefined 语义）', () => {
+    const built = gemini.buildChat(target, {
+      messages: [
+        { role: 'user', content: 'x' },
+        { role: 'assistant', content: '答', tool_calls: [{ id: 'c1', name: 't', arguments: '{}' }] },
+      ],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    const modelContent = body.contents.find((item: { role: string }) => item.role === 'model')
+    expect(modelContent.parts[0]).toEqual({ text: '答' })
+    expect(modelContent.parts[1]).toEqual({ function_call: { name: 't', args: {}, id: 'c1' } })
+    expect('thoughtSignature' in modelContent.parts[0]).toBe(false)
+    expect('thoughtSignature' in modelContent.parts[1]).toBe(false)
+  })
+
+  it('流式：文本签名走 thought_signature 事件，工具签名走 tool_call_delta', async () => {
+    const out = await events([
+      'data: {"candidates":[{"content":{"parts":[{"text":"答案","thoughtSignature":"sig-text"}]}}]}\n\n',
+      'data: {"candidates":[{"content":{"parts":[{"function_call":{"name":"a","args":{},"id":"c1"},"thoughtSignature":"sig-a"}]}}]}\n\n',
+      'data: {"candidates":[{"content":{"parts":[{"function_call":{"name":"b","args":{},"id":"c2"}}]}}]}\n\n',
+    ])
+    expect(out).toContainEqual({ type: 'thought_signature', signature: 'sig-text' })
+    const deltas = out.filter((item) => item.type === 'tool_call_delta')
+    expect(deltas[0]).toMatchObject({ index: 0, name: 'a', thoughtSignature: 'sig-a' })
+    expect(deltas[1]).toMatchObject({ index: 1, name: 'b' })
+    expect((deltas[1] as { thoughtSignature?: string }).thoughtSignature).toBeUndefined()
+  })
+
+  it('流式：多帧下发的工具调用索引连续递增，不塌缩到 0', async () => {
+    const out = await events([
+      'data: {"candidates":[{"content":{"parts":[{"function_call":{"name":"a","args":{},"id":"c1"}}]}}]}\n\n',
+      'data: {"candidates":[{"content":{"parts":[{"function_call":{"name":"b","args":{},"id":"c2"}}]}}]}\n\n',
+    ])
+    const deltas = out.filter((item) => item.type === 'tool_call_delta')
+    expect(deltas.map((item) => (item as { index: number }).index)).toEqual([0, 1])
+  })
+
+  it('完整往返：解析出的签名原样塞回下一轮请求', () => {
+    const first = gemini.parseResponse({
+      candidates: [{
+        content: { parts: [
+          { text: '先查天气', thoughtSignature: 'sig-t' },
+          { function_call: { name: 'get_weather', args: { city: '北京' }, id: 'c1' }, thoughtSignature: 'sig-c' },
+        ] },
+        finish_reason: 'STOP',
+      }],
+    })
+    const built = gemini.buildChat(target, {
+      messages: [
+        { role: 'user', content: '北京天气' },
+        {
+          role: 'assistant',
+          content: first.text,
+          ...(first.thoughtSignature ? { thought_signature: first.thoughtSignature } : {}),
+          tool_calls: first.toolCalls,
+        },
+        { role: 'tool', tool_call_id: 'c1', content: '{"temp":20}' },
+      ],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    const modelContent = body.contents.find((item: { role: string }) => item.role === 'model')
+    expect(modelContent.parts[0].thoughtSignature).toBe('sig-t')
+    expect(modelContent.parts[1].thoughtSignature).toBe('sig-c')
+  })
+})

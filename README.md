@@ -157,6 +157,38 @@ for await (const event of llm.stream({ model: 'reasoner', messages })) {
 
 非流式结果里是 `result.reasoning`。推理内容只返回给调用方，不会在后续请求里回传（Anthropic 的 thinking 签名无法重建）。
 
+### Gemini 思考签名（必须回传）
+
+Gemini 2.5/3.x 的思考模型对 `functionCall` part 的 `thoughtSignature` 做**严格校验**：多轮工具调用时，带签名的 part 必须原样回传，否则上游直接返回 `400 INVALID_ARGUMENT: Function call is missing a thought_signature`。这不是可选的性能优化，不处理会让 Gemini + 工具的多轮调用完全不可用。
+
+签名挂在 part 上，所以有两个位置：
+
+| 来源 | 字段 | 回传位置 |
+| --- | --- | --- |
+| 文本 part 的签名 | `ChatResult.thought_signature` / `thought_signature` 流事件 | 下一轮 assistant 消息的 `thought_signature` |
+| 工具调用 part 的签名 | `ChatResult.tool_calls[].thought_signature` / `tool_call_delta.thought_signature` | 同一条 `tool_calls[].thought_signature` |
+
+```ts
+const result = await llm.chat({ model: 'gemini', messages, tools })
+if (result.tool_calls?.length) {
+  messages.push({
+    role: 'assistant',
+    content: result.text,
+    // 两个签名都要带上，否则下一轮会 400
+    ...(result.thought_signature ? { thought_signature: result.thought_signature } : {}),
+    tool_calls: result.tool_calls,
+  })
+  // ...执行工具，push tool 消息，再次调用
+}
+```
+
+说明：
+
+- 并行工具调用时上游只在**第一个** `functionCall` part 上给签名，插件如实反映（只有 `tool_calls[0]` 带 `thought_signature`），回传时也只需要这一个。
+- 流式调用同样可用：文本签名通过 `thought_signature` 事件透出，工具签名在 `tool_call_delta` 上，`done.result` 里是汇总后的最终值。
+- 其他协议（OpenAI 兼容、Anthropic）不产生也不需要这个字段，传了会被忽略。
+- 调用方如果只存 `text` 和 `tool_calls` 而不存签名，Gemini 多轮工具调用会失败——这是接入 Gemini 时最容易漏的一步。
+
 ### 多模态输入
 
 `content` 可以是字符串，也可以是内容片段数组：
@@ -213,6 +245,7 @@ if (result.tool_calls?.length) {
 - `ToolCall.arguments` 统一为 JSON 字符串。
 - 流式工具调用通过 `tool_call_delta` 返回，按 `index` 累积 `arguments_delta`；`done` 事件包含组装后的 `tool_calls`。
 - `tool_choice: 'none'` 在 Anthropic 协议下等价于不发送 `tools`（Anthropic 没有 `none` 类型）。
+- Gemini 的工具调用带 `thought_signature`，多轮时必须原样回传，见上一节「Gemini 思考签名」。
 - 工具执行、循环次数、权限和超时预算由调用方控制。
 
 ### 错误

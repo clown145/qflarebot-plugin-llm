@@ -35,6 +35,16 @@ export interface ToolCall {
   name: string
   /** 统一成 JSON 字符串：OpenAI 原样，Anthropic 的 input 对象序列化 */
   arguments: string
+  /**
+   * Gemini 思考签名（`thoughtSignature`）。
+   *
+   * Gemini 2.5/3.x 的思考模型对 functionCall part 的签名做**严格校验**：多轮工具调用时
+   * 把带签名的 functionCall part 原样回传，缺签名会直接 `400 INVALID_ARGUMENT`。
+   * 并行工具调用时上游只在**第一个** functionCall part 上给签名，所以这里也只会有第一个带。
+   *
+   * 调用方需要把它随 tool_calls 一起保存，下一轮原样传回（其他协议忽略此字段）。
+   */
+  thought_signature?: string
 }
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool'
@@ -54,6 +64,14 @@ export interface ChatMessage {
    * 该字段只作为调用方本地记录的存在，发给本服务时会被静默忽略。
    */
   reasoning?: string
+  /**
+   * Gemini 文本 part 的思考签名（`thoughtSignature`）。
+   *
+   * 与 `ToolCall.thought_signature` 是同一机制的两个位置：Gemini 的签名挂在 part 上，
+   * 文本 part 的签名需要随文本一起回传。调用方从 `ChatResult.thought_signature` 拿到后
+   * 原样塞回下一轮的 assistant 消息即可；其他协议忽略此字段。
+   */
+  thought_signature?: string
 }
 
 export type ToolChoice = 'auto' | 'none' | 'required' | { name: string }
@@ -93,6 +111,12 @@ export interface ChatResult {
   /** 推理模型的思考内容；上游没返回时不出现 */
   reasoning?: string
   tool_calls?: ToolCall[]
+  /**
+   * Gemini 文本 part 的思考签名；需要调用方保存并在下一轮作为
+   * `ChatMessage.thought_signature` 原样回传。工具调用各自的签名在
+   * `tool_calls[].thought_signature` 上。
+   */
+  thought_signature?: string
   finish_reason?: FinishReason
   alias: string
   /** 供应商标识（配置里的 id） */
@@ -106,7 +130,7 @@ export interface ChatResult {
 export type StreamEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'reasoning_delta'; text: string }
-  | { type: 'tool_call_delta'; index: number; id?: string; name?: string; arguments_delta?: string }
+  | { type: 'tool_call_delta'; index: number; id?: string; name?: string; arguments_delta?: string; thought_signature?: string }
   | { type: 'done'; result: ChatResult }
 
 export interface ModelInfo {

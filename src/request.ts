@@ -77,6 +77,10 @@ function checkMessage(message: ChatMessage, index: number): void {
   if (!isRecord(message)) bad(`${where} 必须是对象`)
   if (!ROLES.has(message.role)) bad(`${where}.role 不合法`)
   if (message.reasoning !== undefined && typeof message.reasoning !== 'string') bad(`${where}.reasoning 必须是字符串`)
+  // Gemini 思考签名：调用方原样回传，这里只校验类型（其他协议忽略）
+  if (message.thought_signature !== undefined && typeof message.thought_signature !== 'string') {
+    bad(`${where}.thought_signature 必须是字符串`)
+  }
 
   if (message.role === 'system' || message.role === 'user') {
     checkContent(message.content, `${where}.content`, false)
@@ -96,6 +100,9 @@ function checkMessage(message: ChatMessage, index: number): void {
     if (!call.name) bad(`${where}.tool_calls[${i}].name 必填`)
     if (typeof call.arguments !== 'string') bad(`${where}.tool_calls[${i}].arguments 必须是字符串`)
     checkArguments(call.arguments, `${where}.tool_calls[${i}]`)
+    if (call.thought_signature !== undefined && typeof call.thought_signature !== 'string') {
+      bad(`${where}.tool_calls[${i}].thought_signature 必须是字符串`)
+    }
   }
 }
 

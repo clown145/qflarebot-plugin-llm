@@ -25,6 +25,8 @@ const DEFAULT_MAX_TOKENS = 8192
 interface GeminiPart {
   text?: string
   thought?: boolean
+  /** 思考签名：Gemini 2.5/3.x 要求带签名的 part 原样回传，缺失会 400 */
+  thoughtSignature?: string
   inline_data?: { mime_type: string; data: string }
   file_data?: { file_uri: string; mime_type?: string }
   function_call?: { name: string; args?: Record<string, unknown>; id?: string }
@@ -144,8 +146,16 @@ function mapMessages(messages: ChatMessage[]): { system: string; contents: Gemin
     }
     if (message.role === 'assistant') {
       const parts: GeminiPart[] = []
-      // 思考内容不回传（Gemini 的 thought part 带签名语义，重建会校验失败），同 Anthropic 策略
-      parts.push(...contentParts(message.content, where))
+      // 思考内容文本不回传（Gemini 的 thought part 无法重建），但签名必须回传：
+      // 文本 part 的签名挂在 message.thought_signature，工具调用的挂在各自的 tool_call 上。
+      // 顺序保持「文本在前、工具调用在后」，与上游返回的 part 顺序一致。
+      const textParts = contentParts(message.content, where)
+      if (textParts.length && message.thought_signature) {
+        // 签名属于文本 part：贴到最后一个文本 part 上（上游把签名放在承载该轮思考的 part 上）
+        const last = textParts[textParts.length - 1]!
+        last.thoughtSignature = message.thought_signature
+      }
+      parts.push(...textParts)
       for (const call of message.tool_calls ?? []) {
         let args: Record<string, unknown>
         try {
@@ -154,7 +164,10 @@ function mapMessages(messages: ChatMessage[]): { system: string; contents: Gemin
           throw new LLMError('bad_request', `${where} 的工具调用参数不是合法 JSON`)
         }
         if (!isRecord(args)) throw new LLMError('bad_request', `${where} 的工具调用参数必须是 JSON 对象`)
-        parts.push({ function_call: { name: call.name, args, ...(call.id ? { id: call.id } : {}) } })
+        parts.push({
+          function_call: { name: call.name, args, ...(call.id ? { id: call.id } : {}) },
+          ...(call.thought_signature ? { thoughtSignature: call.thought_signature } : {}),
+        })
       }
       if (!parts.length) throw new LLMError('bad_request', `${where} 既没有内容也没有工具调用`)
       push('model', parts)
@@ -269,13 +282,19 @@ function parseResponse(json: unknown): ParsedResponse {
   const parts = asArray(content['parts'])
   let text = ''
   let reasoning = ''
+  /** 文本 part 的签名（取最后一个带签名的文本 part；Gemini 只在这类 part 上给） */
+  let textSignature: string | undefined
   const toolCalls: ToolCall[] = []
   parts.forEach((raw, index) => {
     if (!isRecord(raw)) return
     const thought = raw['thought'] === true
     const partText = asString(raw['text'])
+    const signature = asString(raw['thoughtSignature']) || asString(raw['thought_signature'])
     if (partText && thought) reasoning += partText
-    else if (partText) text += partText
+    else if (partText) {
+      text += partText
+      if (signature) textSignature = signature
+    }
     const call = isRecord(raw['function_call']) ? raw['function_call'] : undefined
     if (call) {
       const name = asString(call['name'])
@@ -285,6 +304,7 @@ function parseResponse(json: unknown): ParsedResponse {
         id: asString(call['id']) || `call_${index}`,
         name,
         arguments: JSON.stringify(args),
+        ...(signature ? { thought_signature: signature } : {}),
       })
     }
   })
@@ -293,6 +313,7 @@ function parseResponse(json: unknown): ParsedResponse {
   return {
     text,
     ...(reasoning ? { reasoning } : {}),
+    ...(textSignature ? { thoughtSignature: textSignature } : {}),
     ...(toolCalls.length ? { toolCalls } : {}),
     ...(finishReason ? { finishReason } : {}),
     ...(usage ? { usage } : {}),
@@ -350,6 +371,9 @@ async function* parseStream(
   ctx?: StreamContext,
 ): AsyncGenerator<ParsedStreamEvent> {
   const upstream = upstreamOf(ctx)
+  // 工具槽位在整条流内连续递增：Gemini 一次响应里 parts 可能分多帧下发，
+  // 每帧重置会让多个工具调用塌缩到 index 0
+  let toolIndex = 0
   for await (const message of readSSE(body)) {
     if (!message.data.trim()) continue
     let json: unknown
@@ -374,13 +398,16 @@ async function* parseStream(
       if (!isRecord(raw)) continue
       const content = isRecord(raw['content']) ? raw['content'] : {}
       const parts = asArray(content['parts'])
-      let toolIndex = 0
+      // 工具槽位在整条流内连续递增（Gemini 一次响应里 parts 可能分多帧下发）
       for (const partRaw of parts) {
         if (!isRecord(partRaw)) continue
         const thought = partRaw['thought'] === true
         const text = asString(partRaw['text'])
+        const signature = asString(partRaw['thoughtSignature']) || asString(partRaw['thought_signature'])
         if (text) {
           yield { type: thought ? 'reasoning_delta' : 'text_delta', text }
+          // 文本 part 的签名单独透出：调用方要保存它并在下一轮回传
+          if (signature && !thought) yield { type: 'thought_signature', signature }
           continue
         }
         const call = isRecord(partRaw['function_call']) ? partRaw['function_call'] : undefined
@@ -394,8 +421,12 @@ async function* parseStream(
               id: asString(call['id']) || undefined,
               name,
               argumentsDelta: JSON.stringify(args),
+              ...(signature ? { thoughtSignature: signature } : {}),
             }
           }
+        } else if (signature && !text) {
+          // 既无文本也非工具调用的 part 上的签名（如纯 thinking part）：单独透出，不丢
+          yield { type: 'thought_signature', signature }
         }
       }
       const reason = geminiFinish(raw['finish_reason'] ?? raw['finishReason'])

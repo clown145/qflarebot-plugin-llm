@@ -15,6 +15,8 @@ export interface ParsedResponse {
   text: string
   /** 推理模型的思考内容（DeepSeek reasoning_content / Anthropic thinking） */
   reasoning?: string
+  /** 文本 part 的 Gemini 思考签名（其他协议不产生） */
+  thoughtSignature?: string
   toolCalls?: ToolCall[]
   finishReason?: FinishReason
   usage?: Usage
@@ -23,7 +25,9 @@ export interface ParsedResponse {
 export type ParsedStreamEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'reasoning_delta'; text: string }
-  | { type: 'tool_call_delta'; index: number; id?: string; name?: string; argumentsDelta?: string }
+  | { type: 'tool_call_delta'; index: number; id?: string; name?: string; argumentsDelta?: string; thoughtSignature?: string }
+  /** 文本 part 的思考签名（Gemini）；可能在文本 delta 前后任意时刻到达 */
+  | { type: 'thought_signature'; signature: string }
   | { type: 'usage'; usage: Usage }
   | { type: 'finish'; reason?: FinishReason }
 
