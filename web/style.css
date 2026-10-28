@@ -919,6 +919,38 @@ details.advanced .desc {
   flex-direction: column;
 }
 
+/* 行主体可点（AstrBot 式交互）：hover 与键盘焦点给出可点暗示 */
+.model-main.clickable {
+  cursor: pointer;
+  border-radius: var(--qb-radius-sm, 6px);
+  padding: 3px 6px;
+  margin: -3px -6px;
+  transition: background-color 0.12s ease;
+}
+
+.model-main.clickable:hover {
+  background: var(--qb-surface-muted);
+}
+
+.model-main.clickable:focus-visible {
+  outline: 2px solid var(--qb-accent, var(--qb-fg));
+  outline-offset: 1px;
+}
+
+.available-item.clickable {
+  cursor: pointer;
+}
+
+.available-item.clickable:hover {
+  border-color: var(--qb-accent, var(--qb-border));
+  background: var(--qb-surface-muted);
+}
+
+.available-item.clickable:focus-visible {
+  outline: 2px solid var(--qb-accent, var(--qb-fg));
+  outline-offset: 1px;
+}
+
 .model-row {
   display: flex;
   flex-wrap: wrap;

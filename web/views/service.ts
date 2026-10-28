@@ -147,7 +147,7 @@ function protocolMeta(id: ProtocolId): ProtocolMeta | undefined {
 }
 
 function protocolLabel(id: ProtocolId): string {
-  return protocolMeta(id)?.label ?? (id === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容')
+  return protocolMeta(id)?.label ?? (id === 'anthropic' ? 'Anthropic' : id === 'gemini' ? 'Google Gemini' : 'OpenAI 兼容')
 }
 
 function providerInput(provider: ProviderDraft): PublicProviderInput {
@@ -1020,28 +1020,38 @@ function modelRow(model: ModelConfig): HTMLElement {
   const remove = h('button', { class: 'btn small danger', text: '删除', type: 'button' })
   remove.addEventListener('click', () => void deleteModel(model))
 
+  // AstrBot 同款交互：行主体可点进入编辑（右侧操作区的按钮各自 stopPropagation 语义靠 DOM 层级天然隔离）
+  const main = h(
+    'div',
+    { class: 'model-main clickable', attrs: { role: 'button', tabindex: '0', title: '编辑这个模型别名' } },
+    h(
+      'div',
+      { class: 'model-title' },
+      h('span', { class: 'model-alias mono', text: model.alias || '—' }),
+      isDefault ? badge('默认', 'ok') : null,
+      !model.enabled ? badge('已停用', '') : null,
+    ),
+    h(
+      'div',
+      { class: 'model-sub' },
+      h('span', { class: 'mono small muted', text: model.model || '—' }),
+      h('span', { class: 'model-sep', text: '·' }),
+      contextBadge(model),
+      capabilityBadges(model, provider),
+    ),
+  )
+  main.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => rerenderView() }))
+  main.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      openModelDialog({ model, providerId: model.provider, onSaved: () => rerenderView() })
+    }
+  })
+
   return h(
     'div',
     { class: 'model-row' },
-    h(
-      'div',
-      { class: 'model-main' },
-      h(
-        'div',
-        { class: 'model-title' },
-        h('span', { class: 'model-alias mono', text: model.alias || '—' }),
-        isDefault ? badge('默认', 'ok') : null,
-        !model.enabled ? badge('已停用', '') : null,
-      ),
-      h(
-        'div',
-        { class: 'model-sub' },
-        h('span', { class: 'mono small muted', text: model.model || '—' }),
-        h('span', { class: 'model-sep', text: '·' }),
-        contextBadge(model),
-        capabilityBadges(model, provider),
-      ),
-    ),
+    main,
     h('div', { class: 'model-actions' }, h('span', { class: 'small muted', text: model.enabled ? '启用' : '停用' }), toggle, test, edit, remove),
   )
 }
@@ -1067,14 +1077,31 @@ function availableSection(): HTMLElement | null {
     const add = h('button', { class: 'available-add', text: '+', type: 'button', title: `添加 ${name}` })
     add.disabled = service.adding
     add.addEventListener('click', () => void addAvailableModel(name, add))
-    grid.append(
-      h(
-        'div',
-        { class: 'available-item' },
-        h('span', { class: 'available-name mono', text: name }),
-        add,
-      ),
+    // AstrBot 同款交互：整条可用模型可点即添加，不只是右侧的 + 号
+    const item = h(
+      'div',
+      {
+        class: 'available-item clickable',
+        attrs: { role: 'button', ...(service.adding ? {} : { tabindex: '0' }), title: `添加 ${name}` },
+      },
+      h('span', { class: 'available-name mono', text: name }),
+      add,
     )
+    const trigger = () => {
+      if (service.adding) return
+      void addAvailableModel(name, add)
+    }
+    item.addEventListener('click', (event) => {
+      if (event.target === add) return // + 按钮自己的监听器会处理
+      trigger()
+    })
+    item.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        trigger()
+      }
+    })
+    grid.append(item)
   }
 
   return h(
@@ -1101,7 +1128,9 @@ function modelsPanel(): HTMLElement {
   if (!draft) return h('div')
   const all = modelsOf(draft.id)
 
-  const refresh = h('button', { class: 'btn small', text: service.fetching ? '拉取中…' : '刷新上游', type: 'button' })
+  // AstrBot 同款语义：供应商设置有未保存修改时，按钮明示「保存并拉取」，把隐式保存摆到台面上
+  const dirty = service.isNew || draftDirty()
+  const refresh = h('button', { class: 'btn small', text: service.fetching ? '拉取中…' : dirty ? '保存并拉取' : '刷新上游', type: 'button' })
   refresh.disabled = service.fetching || service.adding
   refresh.addEventListener('click', () => void fetchUpstreamModels())
   const add = h('button', { class: 'btn primary small', text: '添加模型', type: 'button' })
@@ -1120,7 +1149,7 @@ function modelsPanel(): HTMLElement {
     })
     const rows = h('div', { class: 'model-list' })
     if (service.isNew || draftDirty()) {
-      rows.append(h('div', { class: 'issue warn compact' }, '供应商设置还没保存；拉取上游或添加模型时会先自动保存当前设置。'))
+      rows.append(h('div', { class: 'issue warn compact' }, '供应商设置还没保存；拉取上游或添加模型时会先自动保存当前设置（按钮上的「保存并拉取」就是这件事）。'))
     }
     if (!shown.length) {
       rows.append(
