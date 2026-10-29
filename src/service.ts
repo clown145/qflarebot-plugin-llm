@@ -20,6 +20,7 @@ import { mergeUsage } from './protocols/shared.js'
 import { adapterFor } from './protocols/registry.js'
 import type { BuiltRequest, ParsedResponse, ProtocolAdapter } from './protocols/types.js'
 import { validateChatRequest } from './request.js'
+import { mapHistoryToolNames, mapRequestToolNames, mapResultToolNames, toolNameMapFor, type ToolNameMap } from './toolNames.js'
 import { CONFIG_READ_FAILED, type ConfigStore, type LoadedConfig } from './store.js'
 import { fetchJson, openStream, type TransportOptions } from './transport.js'
 import { fetchError, type UpstreamContext } from './upstream.js'
@@ -38,6 +39,8 @@ interface Prepared {
   model: ModelConfig
   adapter: ProtocolAdapter
   request: ChatRequest
+  /** 内部工具名 ↔ 上游 wire 名；单次调用有效 */
+  toolNames: ToolNameMap
   timeoutMs: number
   maxRetries: number
 }
@@ -179,23 +182,32 @@ export class LLM implements LLMService {
           count(event.id)
           count(event.name)
           count(event.argumentsDelta)
+          // 上游给的是 wire 名，对外一律换成内部名：调用方拿它去自己的工具表里查，
+          // 拿到 `time_now` 会查不到（插件定义的是 `time.now`）。
+          const internalName = event.name ? prepared.toolNames.toInternal(event.name) : undefined
           const current: ToolCall = calls[event.index] ?? { id: '', name: '', arguments: '' }
           if (event.id) current.id = event.id
-          if (event.name) current.name = event.name
+          if (internalName) current.name = internalName
           if (event.argumentsDelta) current.arguments += event.argumentsDelta
           calls[event.index] = current
           yield {
             type: 'tool_call_delta',
             index: event.index,
             ...(event.id ? { id: event.id } : {}),
-            ...(event.name ? { name: event.name } : {}),
+            ...(internalName ? { name: internalName } : {}),
             ...(event.argumentsDelta ? { arguments_delta: event.argumentsDelta } : {}),
           }
         } else if (event.type === 'thought_signature') {
           const { type: _type, ...signature } = event
           count(signature.signature)
-          thoughtSignatures.push(signature)
-          yield { type: 'thought_signature', ...signature }
+          // 签名里若带 tool_name，那是上游名；对外统一用内部名，
+          // 这样调用方保存后下一轮回传时与非流式路径的字段口径一致
+          const mappedSignature =
+            signature.tool_name === undefined
+              ? signature
+              : { ...signature, tool_name: prepared.toolNames.toInternal(signature.tool_name) }
+          thoughtSignatures.push(mappedSignature)
+          yield { type: 'thought_signature', ...mappedSignature }
         } else if (event.type === 'usage') {
           usage = mergeUsage(usage, event.usage)
         } else if (event.type === 'finish') {
@@ -356,12 +368,18 @@ export class LLM implements LLMService {
       effective.max_tokens = maxTokens
     }
 
+    // 工具名合法化：插件用 `time.now` 这种可读名字，而上游只收 `[a-zA-Z0-9_-]`
+    // （OpenAI 兼容含 DeepSeek 会直接 400）。映射按本次请求出现的名字建立，
+    // 覆盖要发的工具与历史里出现过的调用名（后者用于多轮回填）。
+    const toolNames = toolNameMapFor(effective, target.provider.protocol)
+
     return {
       config,
       provider: target.provider,
       model: target.model,
       adapter,
       request: effective,
+      toolNames,
       timeoutMs,
       maxRetries,
     }
@@ -392,7 +410,10 @@ export class LLM implements LLMService {
 
   private build(prepared: Prepared, stream: boolean): BuiltRequest {
     try {
-      return prepared.adapter.buildChat({ provider: prepared.provider, model: prepared.model }, prepared.request, stream)
+      // 发出去的名字必须是 wire 名：tools 列表、tool_choice、以及历史里回填的 tool_calls。
+      // 三者都用同一个映射，保证「这一轮发的名字」与「上一轮回填的名字」对得上。
+      const wireRequest = mapHistoryToolNames(mapRequestToolNames(prepared.request, prepared.toolNames), prepared.toolNames)
+      return prepared.adapter.buildChat({ provider: prepared.provider, model: prepared.model }, wireRequest, stream)
     } catch (err) {
       if (err instanceof LLMError) throw err
       throw new LLMError('bad_request', `构造上游请求失败：${errorMessage(err)}`, {
@@ -404,12 +425,14 @@ export class LLM implements LLMService {
   }
 
   private result(prepared: Prepared, parsed: ParsedResponse, startedAt: number): ChatResult {
-    const toolCalls = parsed.toolCalls?.length ? parsed.toolCalls : undefined
+    // 上游给的是 wire 名，调用方只认自己定义的名字：这里换回去（含 Gemini 签名里的 tool_name）
+    const mapped = mapResultToolNames(parsed.toolCalls, parsed.thoughtSignatures, prepared.toolNames)
+    const toolCalls = mapped.toolCalls?.length ? mapped.toolCalls : undefined
     const finish = parsed.finishReason ?? (toolCalls ? 'tool_calls' : undefined)
     return {
       text: parsed.text,
       ...(parsed.reasoning ? { reasoning: parsed.reasoning } : {}),
-      ...(parsed.thoughtSignatures?.length ? { thought_signatures: parsed.thoughtSignatures } : {}),
+      ...(mapped.thoughtSignatures?.length ? { thought_signatures: mapped.thoughtSignatures } : {}),
       ...(toolCalls ? { tool_calls: toolCalls } : {}),
       ...(finish ? { finish_reason: finish } : {}),
       alias: prepared.model.alias,
