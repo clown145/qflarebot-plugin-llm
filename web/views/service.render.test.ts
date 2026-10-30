@@ -25,7 +25,7 @@ const { mockState } = vi.hoisted(() => ({
     meta: { protocols: [] },
     busy: false,
     version: 1,
-  } as never,
+  } as Record<string, unknown>,
 }))
 
 vi.mock('../api.js', () => ({
@@ -33,8 +33,8 @@ vi.mock('../api.js', () => ({
   toast: vi.fn(async () => {}),
 }))
 vi.mock('../save.js', () => ({
-  updateConfig: vi.fn(async (mutate: (config: never) => void) => {
-    mutate(mockState.config)
+  updateConfig: vi.fn(async (mutate: (config: Record<string, unknown>) => void) => {
+    mutate(mockState.config as Record<string, unknown>)
     return true
   }),
   takeDroppedSecrets: vi.fn(() => []),
