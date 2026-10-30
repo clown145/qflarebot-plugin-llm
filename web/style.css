@@ -78,17 +78,61 @@ h3 {
   justify-content: flex-end;
 }
 
+/*
+ * 页内标签。对标 `QSegmented`。
+ *
+ * 关键：**选中态不是给按钮改背景**，而是一个绝对定位的指示块滑过去。
+ * 规范原文（动效表）：「页内标签：选中块滑过去」。
+ *
+ * 两种做法看起来都是「选中项有底色」，但滑动版有连续的位移感，
+ * 直接改背景是硬切 —— 这就是「切换生硬」的来源。
+ */
 .tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--qb-space-1);
-  padding: var(--qb-space-1);
+  /* 窄屏放不下时横向滚动，不换行（换行会让指示块跨行，算不出位置） */
+  overflow-x: auto;
+  padding-bottom: 2px;
   margin-bottom: var(--qb-space-4);
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.tabs-inner {
+  position: relative;
+  display: inline-flex;
+  gap: 2px;
+  padding: var(--qb-space-1);
   background: var(--qb-surface-muted);
   border-radius: var(--qb-radius-full);
 }
 
+.tab-indicator {
+  position: absolute;
+  top: var(--qb-space-1);
+  bottom: var(--qb-space-1);
+  left: 0;
+  width: 0;
+  border-radius: var(--qb-radius-full);
+  background: var(--qb-surface);
+  box-shadow: var(--qb-shadow);
+  pointer-events: none;
+  /* 首次渲染不画动画（JS 会在下一帧才加 .animate） */
+  opacity: 0;
+}
+
+.tab-indicator.animate {
+  opacity: 1;
+  /* ease-spring 带一点回弹，规范说它「只用于小元素：开关圆钮、选中块」 */
+  transition:
+    transform var(--qb-duration-slow) var(--qb-ease-spring),
+    width var(--qb-duration-slow) var(--qb-ease-spring);
+}
+
 .tab {
+  position: relative;
+  z-index: 1;
   padding: 6px 14px;
   border: 0;
   border-radius: var(--qb-radius-full);
@@ -96,7 +140,10 @@ h3 {
   color: var(--qb-fg-muted);
   font: inherit;
   font-size: var(--qb-text-sm);
+  white-space: nowrap;
   cursor: pointer;
+  /* 文字颜色过渡：规范要求页内标签有过渡 */
+  transition: color var(--qb-duration) var(--qb-ease);
 }
 
 .tab:hover {
@@ -104,9 +151,31 @@ h3 {
 }
 
 .tab.active {
-  background: var(--qb-surface);
   color: var(--qb-fg);
-  box-shadow: var(--qb-shadow);
+  font-weight: 500;
+}
+
+/*
+ * 内容区入场。规范：「内容旧的淡出、新的淡入并上浮 6px」。
+ *
+ * 只做入场不做离场：旧内容在 clear() 里已整个移除，要让它淡出得等动画
+ * 跑完，那会让点击到内容出现之间多出 160ms 空档，反而更卡。
+ */
+.tab-content {
+  opacity: 0;
+}
+
+.tab-content--in {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity var(--qb-duration-slow) var(--qb-ease-out),
+    transform var(--qb-duration-slow) var(--qb-ease-out);
+}
+
+/* 还没有 .tab-content--in 时的初始位移（渲染后下一帧加上，形成上浮） */
+.tab-content:not(.tab-content--in) {
+  transform: translateY(6px);
 }
 
 /*

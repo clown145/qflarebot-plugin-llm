@@ -77,18 +77,107 @@ function header(): HTMLElement {
   )
 }
 
+/**
+ * 页内标签。对标 `QSegmented`（`packages/ui/src/components/ui/QSegmented.vue`）。
+ *
+ * ## 规范原文（MASTER.md「动效」表）
+ *
+ * > 页内标签：选中块滑过去；内容旧的淡出、新的淡入并上浮 6px
+ *
+ * 所以这里**不是**给当前 tab 改个背景色 —— 而是一个绝对定位的
+ * 「指示块」用 `translateX` + `width` 滑到选中项下面。两种做法看起来
+ * 都是「选中项有底色」，但滑动版有连续的位移感，直接改背景是硬切。
+ *
+ * ## 三个容易漏的细节（都照 QSegmented）
+ *
+ * 1. **首次渲染不要动画**：`animate` 标志在 `requestAnimationFrame` 之后
+ *    才置真。否则页面刚打开时指示块会从 `translateX(0)` 滑到第一个 tab，
+ *    看着像刚加载出来就抖一下。
+ * 2. **尺寸变了要重新量**：字体加载完、窗口缩放都会让 tab 宽度变化，
+ *    用 `ResizeObserver` 跟着重量，不然指示块和文字会错位。
+ * 3. **方向键切换**：`role="tablist"` 下左右方向键是约定，漏了键盘用户
+ *    只能用 Tab 键一个个挪。
+ */
+let tabIndicator: HTMLElement | null = null
+let tabAnimate = false
+let tabObserver: ResizeObserver | null = null
+
+function measureTabIndicator(): void {
+  const root = tabIndicator?.parentElement
+  if (!root || !tabIndicator) return
+  const selected = root.querySelector<HTMLElement>('[aria-selected="true"]')
+  if (!selected) {
+    tabIndicator.style.opacity = '0'
+    return
+  }
+  tabIndicator.style.opacity = '1'
+  // offsetLeft/offsetWidth 相对定位父级，正是指示块要的位置
+  tabIndicator.style.width = `${selected.offsetWidth}px`
+  tabIndicator.style.transform = `translateX(${selected.offsetLeft}px)`
+}
+
 function tabs(): HTMLElement {
-  const nav = h('nav', { class: 'tabs' })
+  const wrappers = h('nav', { class: 'tabs' })
+  // 指示块和 tab 按钮同处一个定位容器，才能用同一个坐标系
+  const root = h('div', { class: 'tabs-inner', attrs: { role: 'tablist', 'aria-label': '页面分区' } })
+  wrappers.append(root)
+
+  const indicator = h('span', {
+    class: 'tab-indicator',
+    attrs: { 'aria-hidden': 'true' },
+  })
+  tabIndicator = indicator
+  root.append(indicator)
+
   for (const tab of TABS) {
+    const active = state.activeTab === tab.id
     const button = h('button', {
-      class: `tab${state.activeTab === tab.id ? ' active' : ''}`,
+      class: `tab${active ? ' active' : ''}`,
       text: tab.label,
       type: 'button',
+      attrs: {
+        role: 'tab',
+        'aria-selected': String(active),
+        // 只有选中的那个进 Tab 序列，其余靠方向键 —— WAI-ARIA 的标准做法
+        tabindex: active ? '0' : '-1',
+      },
     })
     button.addEventListener('click', () => goTab(tab.id))
-    nav.append(button)
+    root.append(button)
   }
-  return nav
+
+  // 方向键左右切换
+  root.addEventListener('keydown', (event) => {
+    const key = (event as KeyboardEvent).key
+    if (key !== 'ArrowLeft' && key !== 'ArrowRight') return
+    event.preventDefault()
+    const index = TABS.findIndex((item) => item.id === state.activeTab)
+    const step = key === 'ArrowRight' ? 1 : -1
+    const next = TABS[(index + step + TABS.length) % TABS.length]
+    if (!next) return
+    goTab(next.id)
+    // 焦点跟到新选中的 tab 上，键盘用户不会丢位置
+    const target = root.querySelector<HTMLElement>(`[role="tab"]:nth-of-type(${
+      TABS.findIndex((item) => item.id === next.id) + 1
+    })`)
+    target?.focus()
+  })
+
+  // 量一次；下一帧再开动画（避免首次渲染时滑动）
+  measureTabIndicator()
+  requestAnimationFrame(() => {
+    tabAnimate = true
+    indicator.classList.add('animate')
+  })
+
+  // 尺寸变化（字体加载、窗口缩放）时重量
+  if (typeof ResizeObserver !== 'undefined') {
+    tabObserver?.disconnect()
+    tabObserver = new ResizeObserver(() => measureTabIndicator())
+    tabObserver.observe(root)
+  }
+
+  return wrappers
 }
 
 function issuesBanner(): HTMLElement | null {
@@ -122,13 +211,23 @@ function render(): void {
   app.append(header(), tabs())
   const banner = issuesBanner()
   if (banner) app.append(banner)
-  const main = h('div')
+  // 内容区包一层：切换时给它一个入场动画（规范：旧的淡出、新的淡入并上浮 6px）。
+  //
+  // 为什么只做「新内容入场」不做「旧内容离场」：旧内容是在 `clear(app)` 里
+  // 整个移除的，要让它淡出得先挂住 DOM 等动画跑完 —— 那会让点击到内容
+  // 出现之间多出 160ms 空档，反而更卡。而**只做入场**是纯视觉收益，
+  // 用户感知到的是「新内容浮上来」，切换依然是即时的。
+  const main = h('div', { class: 'tab-content' })
   app.append(main)
 
   if (state.activeTab === 'overview') renderOverview(main, goTab)
   else if (state.activeTab === 'service') renderService(main, render)
   else if (state.activeTab === 'settings') renderSettings(main, render)
   else renderUsage(main)
+
+  // 用完即删：不加这个的话 `.tab-content` 上的动画类会一直留着，
+  // 之后任何一次重渲染都会再放一遍动画
+  requestAnimationFrame(() => main.classList.add('tab-content--in'))
 
   updateHeader()
   void resizePage()
