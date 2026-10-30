@@ -93,11 +93,35 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
   const current = draft
   const limits = timeoutLimits()
 
-  const listId = 'alias-options'
-  const datalist = h('datalist', { attrs: { id: listId } })
-  for (const model of config.models) datalist.append(h('option', { value: model.alias }))
-
-  const defaultModel = h('input', { value: current.default_model, placeholder: 'chat', attrs: { list: listId } })
+  /**
+   * 默认模型用**下拉**而不是可输入框。
+   *
+   * 原来是 `<input list=datalist>`——看起来像下拉，实际是「手写 + 提示」，
+   * 而且允许填不存在的别名（保存时才被拦）。别名是调用方唯一认的入口，
+   * 填错就是一个运行时才暴露的坑，不如从一开始就只能选。
+   *
+   * `select` 里保留两类特殊项：
+   * - 「（不设置）」：留空是合法配置，调用方必须显式传 model；
+   * - 已停用的别名：老配置可能正指着它，直接不显示会让下拉对不上当前值，
+   *   标成「已停用」并允许选中，靠下面的提示说明后果。
+   */
+  const options: Array<{ value: string; label: string; disabled?: boolean }> = [
+    { value: '', label: '（不设置，调用方必须传 model）' },
+    ...config.models.map((model) => ({
+      value: model.alias,
+      label: model.enabled ? model.alias : `${model.alias}（已停用）`,
+    })),
+  ]
+  // 当前值不在列表里（别名被删了）：补一项，避免 select 静默回落到第一项
+  if (current.default_model && !config.models.some((m) => m.alias === current.default_model)) {
+    options.push({ value: current.default_model, label: `${current.default_model}（已不存在）` })
+  }
+  const defaultModel = h('select')
+  for (const option of options) {
+    defaultModel.append(
+      h('option', { value: option.value, text: option.label, selected: option.value === current.default_model }),
+    )
+  }
   const defaultHint = h('span', { class: 'desc' })
   const refreshDefaultHint = () => {
     const alias = defaultModel.value.trim()
@@ -228,7 +252,6 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
         text: `配置允许填到 ${limits.max} 毫秒，但单次调用实际压到 ${limits.callMax} 毫秒：一次 QQ 事件里所有插件合计只有 30 秒，剩下的留给调用方收尾。`,
       },
     ),
-    datalist,
   )
 
   container.append(card)

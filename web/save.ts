@@ -35,6 +35,20 @@ function issuesOf(err: unknown): ConfigIssue[] | undefined {
   return Array.isArray(errors) ? (errors as ConfigIssue[]) : undefined
 }
 
+/**
+ * 最近一次保存里，因为地址/协议变化而被服务端清空 Key 的供应商 id。
+ *
+ * toast 显示在面板层、一闪而过，容易错过——尤其是页面刚重建过一次的时候。
+ * 视图层读这个值挂一条常驻警告，直到用户重新填 Key。读取后调 `clearDroppedSecrets()`。
+ */
+let lastDroppedSecrets: string[] = []
+
+export function takeDroppedSecrets(): string[] {
+  const value = lastDroppedSecrets
+  lastDroppedSecrets = []
+  return value
+}
+
 async function put(): Promise<Outcome> {
   if (!state.config) return 'failed'
   setBusy(true)
@@ -42,8 +56,9 @@ async function put(): Promise<Outcome> {
     const data = await api.saveConfig({ version: state.version, config: toInput(state.config) })
     applySaved(data)
     // 服务端在地址/协议变化时会清除旧 Key（dropped_secrets）；页面必须提示重填，否则下次调用 401 无从定位
-    if (data.dropped_secrets && data.dropped_secrets.length) {
-      await toast(`这些供应商的 API Key 因接口地址/协议变化已被清除，请重新填写：${data.dropped_secrets.join('、')}`, 'warning')
+    lastDroppedSecrets = data.dropped_secrets ?? []
+    if (lastDroppedSecrets.length) {
+      await toast(`这些供应商的 API Key 因接口地址/协议变化已被清除，请重新填写：${lastDroppedSecrets.join('、')}`, 'warning')
     }
     return 'ok'
   } catch (err) {

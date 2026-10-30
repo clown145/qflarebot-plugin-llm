@@ -14,7 +14,7 @@ import { setPending } from '../pending.js'
 import { aliasBase, isProviderDraftDirty, uniqueProviderId } from '../providerDraft.js'
 import { pickProviderPreset } from '../providerTemplateDialog.js'
 import { rebaseProviderDraft } from '../rebase.js'
-import { updateConfig } from '../save.js'
+import { takeDroppedSecrets, updateConfig } from '../save.js'
 import { onSavedApplied, state } from '../state.js'
 import type { AppConfigDraft, ProviderDraft } from '../types.js'
 import { clone, toInput, uniqueAlias } from '../types.js'
@@ -52,6 +52,14 @@ interface ServiceState {
   aliasSearch: string
   fetching: boolean
   adding: boolean
+  /**
+   * 上次保存时因为「接口地址/协议变了」而被清空 Key 的供应商 id。
+   *
+   * 服务端的安全策略是对的（不能把旧 Key 发到新地址），但以前只在面板角落弹一个
+   * toast——用户很容易错过，然后下次调用 401 却不知道为什么。这里记下来，
+   * 在供应商卡片里挂一条常驻警告，直到用户重新填写 Key。
+   */
+  keyClearedFor: string | null
 }
 
 const service: ServiceState = {
@@ -68,6 +76,7 @@ const service: ServiceState = {
   aliasSearch: '',
   fetching: false,
   adding: false,
+  keyClearedFor: null,
 }
 
 let rerenderView: () => void = () => {}
@@ -75,6 +84,103 @@ let activeSidebarName: HTMLElement | null = null
 let activeSidebarDirty: HTMLElement | null = null
 let activeSidebarMeta: HTMLElement | null = null
 let activeSidebarDot: HTMLElement | null = null
+
+/**
+ * 已挂载的 DOM 引用表。
+ *
+ * ## 为什么需要它
+ *
+ * 这一页原来是「状态一变就调 `rerenderView()`」：`main.ts` 的 `render()` 会把
+ * 整个 `.tab-content` 从 DOM 摘掉再重建。后果是所有输入框、焦点、滚动位置每次都
+ * 重置，视觉上就是保存时整块闪一下——用户抱怨的「一闪一闪」就是这个。
+ *
+ * 现在改成**挂载一次、局部更新**：`renderService` 首次建好 DOM 后把这些引用存在
+ * 这里，之后的保存 / 增删改都只调对应的 `refreshXxx()` 去改那几个节点，
+ * 不触碰整棵树。只有「结构真的变了」（比如切换供应商、进入别名视图）才重建子树。
+ *
+ * 引用为 null 表示当前没有挂载对应区块，刷新时直接跳过——不用到处判空。
+ */
+interface MountedRefs {
+  /** 整个工作区（工作台/别名视图切换时整体替换这一个节点） */
+  root: HTMLElement | null
+  /** 供应商卡片（切换供应商时整块重建） */
+  providerCard: HTMLElement | null
+  /** 模型面板（模型增删改时重建，因为行数会变） */
+  modelsPanel: HTMLElement | null
+  /** 侧栏列表容器（供应商增删、名称改动时重建） */
+  sidebarList: HTMLElement | null
+  /** 供应商卡片里那些「只改文字/禁用态」的节点，刷新时不重建 DOM */
+  providerRefs: {
+    save: HTMLButtonElement
+    dirty: HTMLElement
+    keyBadge: HTMLElement
+    clearKey: HTMLButtonElement
+    key: HTMLInputElement
+    enabledBadge: HTMLElement
+    title: HTMLElement
+    /** 「Key 已被清空」警告条，保存后按 keyClearedFor 显示或隐藏 */
+    keyBanner: HTMLElement
+  } | null
+}
+
+const mounted: MountedRefs = {
+  root: null,
+  providerCard: null,
+  modelsPanel: null,
+  sidebarList: null,
+  providerRefs: null,
+}
+
+/**
+ * 局部刷新的统一入口。
+ *
+ * 优先用局部刷新；只有调用方明确需要整块重建时才退回 `rerenderView()`。
+ * 这样即使某处还没迁移完，行为也是对的——只是会闪一下，不会出错。
+ */
+function refresh(scope: 'provider' | 'models' | 'sidebar' | 'all'): void {
+  if (scope === 'all') {
+    rerenderView()
+    return
+  }
+  // 侧栏与卡片都依赖 draft 的最新状态，按需重建对应子树
+  if (scope === 'sidebar') refreshSidebar()
+  if (scope === 'provider') refreshProviderCard()
+  if (scope === 'models') refreshModelsPanel()
+}
+
+/** 重建侧栏列表（供应商名称、启用状态、别名数变化时用） */
+function refreshSidebar(): void {
+  const container = mounted.sidebarList
+  if (!container) return
+  container.replaceChildren(...sidebarItems())
+}
+
+/**
+ * 刷新供应商卡片上的**状态显示**，不重建 DOM。
+ *
+ * 保存后需要更新的只有按钮可用性、脏标记、Key 徽标这些；输入框里的内容本来就
+ * 是对的（用户刚填的），重建一遍反而会丢焦点、丢光标位置。
+ * 只有切换供应商这种「内容整体换掉」的场景才用 `rebuildProviderCard()`。
+ */
+function refreshProviderCard(): void {
+  if (!service.draft || !mounted.providerRefs) return
+  updateLocal(service.draft, mounted.providerRefs)
+}
+
+/** 整块重建供应商卡片（切换供应商时用，内容全变了） */
+function rebuildProviderCard(): void {
+  const card = mounted.providerCard
+  if (!card || !service.draft) return
+  card.replaceWith(buildProviderCard())
+}
+
+/** 重建模型面板（模型增删改后行数变了） */
+function refreshModelsPanel(): void {
+  const panel = mounted.modelsPanel
+  if (!panel || !service.draft) return
+  panel.replaceWith(buildModelsPanel())
+}
+
 
 export function resetServiceState(): void {
   service.mode = 'workbench'
@@ -325,8 +431,18 @@ async function saveProvider(options: { silent?: boolean } = {}): Promise<boolean
   service.baseVersion = state.version
   service.isNew = false
   if (changedConnection) clearAvailable()
+  // 服务端可能因为地址变化清掉了旧 Key：记下来在卡片里挂常驻警告
+  const dropped = takeDroppedSecrets()
+  if (dropped.includes(saved.id)) service.keyClearedFor = saved.id
+  else if (service.keyClearedFor === saved.id && saved.api_key_set) service.keyClearedFor = null
   syncPending()
-  rerenderView()
+  // **局部刷新，不重建整页**：保存是最频繁的操作，以前这里调 rerenderView()
+  // 会把整个 .tab-content 拆掉重建，输入框焦点、滚动位置全丢，视觉上闪一下。
+  // 现在只更新真正变了的两块——供应商卡片（按钮/徽标状态）和侧栏（名称/别名数）。
+  refresh('provider')
+  refresh('sidebar')
+  // 连接信息变了才需要重建模型面板（上游列表作废、别名可能对不上）
+  if (changedConnection) refresh('models')
   return true
 }
 
@@ -423,7 +539,7 @@ function conflictText(conflicts: MetadataField[]): string {
 async function fetchUpstreamModels(): Promise<void> {
   if (service.fetching || service.adding || !service.draft) return
   service.fetching = true
-  rerenderView()
+  refresh('models')
   try {
     if (!(await ensureProviderSaved())) return
     const provider = service.draft
@@ -438,7 +554,7 @@ async function fetchUpstreamModels(): Promise<void> {
     await toast(err instanceof Error ? err.message : String(err), 'error')
   } finally {
     service.fetching = false
-    rerenderView()
+    refresh('models')
   }
 }
 
@@ -477,7 +593,7 @@ async function addAvailableModel(name: string, button?: HTMLButtonElement): Prom
       button.disabled = false
       button.textContent = '+'
     }
-    rerenderView()
+    refresh('models')
   }
 }
 
@@ -494,7 +610,7 @@ async function addAllAvailable(): Promise<void> {
   if (!ok) return
 
   service.adding = true
-  rerenderView()
+  refresh('models')
   try {
     if (!(await ensureProviderSaved())) return
     const current = service.draft
@@ -555,13 +671,13 @@ async function addAllAvailable(): Promise<void> {
     }
   } finally {
     service.adding = false
-    rerenderView()
+    refresh('models')
   }
 }
 
 async function openAddModel(): Promise<void> {
   if (!(await ensureProviderSaved())) return
-  openModelDialog({ providerId: service.draft?.id, onSaved: () => rerenderView() })
+  openModelDialog({ providerId: service.draft?.id, onSaved: () => refresh('models') })
 }
 
 async function toggleModel(model: ModelConfig, next: boolean): Promise<void> {
@@ -570,7 +686,8 @@ async function toggleModel(model: ModelConfig, next: boolean): Promise<void> {
     const found = config.models.find((item) => item.alias === model.alias)
     if (found) found.enabled = next
   })
-  if (ok) rerenderView()
+  // 只改模型列表：局部重建面板即可，不必整块重绘
+  if (ok) refresh('models')
 }
 
 async function deleteModel(model: ModelConfig): Promise<void> {
@@ -584,7 +701,7 @@ async function deleteModel(model: ModelConfig): Promise<void> {
     },
     { success: '模型已删除' },
   )
-  if (done) rerenderView()
+  if (done) refresh('models')
 }
 
 async function testModel(model: ModelConfig, button: HTMLButtonElement): Promise<void> {
@@ -614,7 +731,7 @@ async function setDefault(alias: string): Promise<void> {
     },
     { success: '默认模型已更新' },
   )
-  if (ok) rerenderView()
+  if (ok) refresh('models')
 }
 
 function switchInput(checked: boolean, onChange: (next: boolean) => void): HTMLElement {
@@ -799,6 +916,8 @@ function sidebar(): HTMLElement {
   const count = (config?.providers.length ?? 0) + (service.isNew && service.draft ? 1 : 0)
   const search = h('input', { type: 'search', value: service.providerSearch, placeholder: '筛选供应商' })
   const listBox = h('div')
+  // 侧栏列表容器登记到引用表：供应商增删/改名/启停时只重建这一块
+  mounted.sidebarList = listBox
   const refreshList = () => listBox.replaceChildren(providerList())
   search.addEventListener('input', () => {
     service.providerSearch = search.value
@@ -819,6 +938,11 @@ function sidebar(): HTMLElement {
   )
 }
 
+/** 侧栏条目列表（不含外层容器，方便局部重建） */
+function sidebarItems(): HTMLElement[] {
+  return [providerList()]
+}
+
 function updateLocal(
   draft: ProviderDraft,
   refs: {
@@ -829,10 +953,14 @@ function updateLocal(
     key: HTMLInputElement
     enabledBadge: HTMLElement
     title: HTMLElement
+    keyBanner: HTMLElement
   },
 ): void {
   const dirty = draftDirty()
-  refs.save.disabled = !dirty || state.busy
+  // 新建供应商时永远可保存：它本身就是一个「待创建」的对象，
+  // 不必等用户改动某个字段才点亮按钮。以前新建时按钮是灰的，
+  // 用户只能去点下面的「保存并拉取」——主操作藏在了副操作里。
+  refs.save.disabled = (!dirty && !service.isNew) || state.busy
   refs.dirty.style.display = dirty ? '' : 'none'
   refs.title.textContent = draft.name.trim() || (service.isNew ? '新供应商' : draft.id)
   refs.enabledBadge.textContent = draft.enabled ? '已启用' : '已停用'
@@ -855,9 +983,11 @@ function updateLocal(
   if (activeSidebarDirty) activeSidebarDirty.style.display = dirty ? '' : 'none'
   if (activeSidebarMeta) activeSidebarMeta.textContent = providerNotes(draft, modelsOf(draft.id).length)
   if (activeSidebarDot) activeSidebarDot.className = `provider-status-dot${draft.enabled ? '' : ' off'}`
+  // 「Key 被清空」警告随状态显隐，不必重建卡片
+  refs.keyBanner.style.display = service.keyClearedFor === draft.id ? '' : 'none'
 }
 
-function providerCard(): HTMLElement {
+function buildProviderCard(): HTMLElement {
   const draft = service.draft
   if (!draft) return h('div')
   const meta = protocolMeta(draft.protocol)
@@ -958,7 +1088,23 @@ function providerCard(): HTMLElement {
   allowHttpHint.style.display = draft.allow_http === true ? '' : 'none'
   const allowHttpBox = h('div', { class: 'field' }, allowHttpLabel, allowHttpHint)
 
-  const refs = { save, dirty: dirtyBadge, keyBadge, clearKey, key, enabledBadge, title }
+  // 保存时因为改地址而被清空 Key 的常驻警告。
+  // 服务端那条安全策略是对的（旧 Key 不能发到新地址），但用户必须看得见后果——
+  // 只在面板角落弹一次 toast 太容易错过，之后调用 401 会完全摸不着头脑。
+  //
+  // 节点常驻、只切 style.display：这样保存后能由 updateLocal 就地切换，
+  // 不必为了显示一条警告重建整张卡片。
+  const keyBanner = h(
+    'div',
+    { class: 'issue warn', attrs: { role: 'alert' } },
+    h('strong', { text: 'API Key 已被清空。' }),
+    ' 因为你修改了接口地址或协议，服务端不会把旧 Key 发到新地址（防止密钥被转发出去）。',
+    '请在下面重新填写 Key 再保存；不填的话调用会失败。',
+  )
+  keyBanner.style.display = service.keyClearedFor === draft.id ? '' : 'none'
+  const refs = { save, dirty: dirtyBadge, keyBadge, clearKey, key, enabledBadge, title, keyBanner }
+  // 登记到引用表：保存后 updateLocal 直接改这些节点的文字/禁用态，不重建卡片
+  mounted.providerRefs = refs
   const touch = () => {
     syncPending()
     updateLocal(draft, refs)
@@ -1043,9 +1189,10 @@ function providerCard(): HTMLElement {
   updateLocal(draft, refs)
   validateHeaders()
 
-  return h(
+  const card = h(
     'div',
     { class: 'qb-card provider-detail' },
+    keyBanner,
     h(
       'div',
       { class: 'provider-head' },
@@ -1086,6 +1233,9 @@ function providerCard(): HTMLElement {
       h('div', { class: 'actions' }, remove),
     ),
   )
+  // 登记引用：保存后要局部刷新卡片时靠它定位，不必重建整个内容区
+  mounted.providerCard = card
+  return card
 }
 
 function modelRow(model: ModelConfig): HTMLElement {
@@ -1096,7 +1246,7 @@ function modelRow(model: ModelConfig): HTMLElement {
   const test = h('button', { class: 'qb-btn qb-btn--sm', text: '测试', type: 'button' })
   test.addEventListener('click', () => void testModel(model, test))
   const edit = h('button', { class: 'qb-btn qb-btn--sm', text: '编辑', type: 'button' })
-  edit.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => rerenderView() }))
+  edit.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => refresh('models') }))
   const remove = h('button', { class: 'qb-btn qb-btn--danger qb-btn--sm', text: '删除', type: 'button' })
   remove.addEventListener('click', () => void deleteModel(model))
 
@@ -1120,11 +1270,11 @@ function modelRow(model: ModelConfig): HTMLElement {
       capabilityBadges(model, provider),
     ),
   )
-  main.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => rerenderView() }))
+  main.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => refresh('models') }))
   main.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault()
-      openModelDialog({ model, providerId: model.provider, onSaved: () => rerenderView() })
+      openModelDialog({ model, providerId: model.provider, onSaved: () => refresh('models') })
     }
   })
 
@@ -1203,14 +1353,25 @@ function availableSection(): HTMLElement | null {
   )
 }
 
-function modelsPanel(): HTMLElement {
+function buildModelsPanel(): HTMLElement {
   const draft = service.draft
   if (!draft) return h('div')
   const all = modelsOf(draft.id)
 
-  // AstrBot 同款语义：供应商设置有未保存修改时，按钮明示「保存并拉取」，把隐式保存摆到台面上
-  const dirty = service.isNew || draftDirty()
-  const refresh = h('button', { class: 'qb-btn qb-btn--sm', text: service.fetching ? '拉取中…' : dirty ? '保存并拉取' : '刷新上游', type: 'button' })
+  // 两个按钮各自只做一件事，名字固定不随状态变：
+  //
+  // 以前是一个按钮在「保存并拉取」和「刷新上游」之间换文案——用户刚记住要点它保存，
+  // 保存完它就变回「刷新上游」，于是再也找不到保存入口。隐式保存不该藏在拉取按钮里。
+  //
+  // 「刷新上游」仍然会在需要时自动保存（因为拉取必须基于已保存的地址与 Key），
+  // 但那属于它的实现细节，按钮上会有说明；保存本身由上面的「保存」按钮负责。
+  const needsSave = service.isNew || draftDirty()
+  const refresh = h('button', {
+    class: 'qb-btn qb-btn--sm',
+    text: service.fetching ? '拉取中…' : '刷新上游',
+    type: 'button',
+    attrs: needsSave ? { title: '会先保存当前供应商设置' } : {},
+  })
   refresh.disabled = service.fetching || service.adding
   refresh.addEventListener('click', () => void fetchUpstreamModels())
   const add = h('button', { class: 'qb-btn qb-btn--primary qb-btn--sm', text: '添加模型', type: 'button' })
@@ -1251,7 +1412,7 @@ function modelsPanel(): HTMLElement {
   })
   updateLists()
 
-  return h(
+  const panel = h(
     'div',
     { class: 'qb-card model-panel' },
     h(
@@ -1269,6 +1430,9 @@ function modelsPanel(): HTMLElement {
     rowsBox,
     availableBox,
   )
+  // 登记引用：模型增删改后只重建这一块
+  mounted.modelsPanel = panel
+  return panel
 }
 
 function emptyWorkbench(): HTMLElement {
@@ -1292,7 +1456,7 @@ function renderAliases(container: HTMLElement): void {
       void toast('先到「按供应商」里添加供应商', 'warning')
       return
     }
-    openModelDialog({ providerId: config.providers[0]!.id, onSaved: () => rerenderView() })
+    openModelDialog({ providerId: config.providers[0]!.id, onSaved: () => refresh('models') })
   })
 
   const search = h('input', { type: 'search', value: service.aliasSearch, placeholder: '筛选别名、供应商或上游模型', class: 'table-search' })
@@ -1325,7 +1489,7 @@ function renderAliases(container: HTMLElement): void {
       const test = h('button', { class: 'qb-btn qb-btn--sm', text: '测试', type: 'button' })
       test.addEventListener('click', () => void testModel(model, test))
       const edit = h('button', { class: 'qb-btn qb-btn--sm', text: '编辑', type: 'button' })
-      edit.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => rerenderView() }))
+      edit.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => refresh('models') }))
       const remove = h('button', { class: 'qb-btn qb-btn--danger qb-btn--sm', text: '删除', type: 'button' })
       remove.addEventListener('click', () => void deleteModel(model))
       const makeDefault = h('button', { class: 'qb-btn qb-btn--ghost qb-btn--sm', text: '设为默认', type: 'button' })
@@ -1429,8 +1593,8 @@ export function renderService(container: HTMLElement, rerender: () => void): voi
   const workspace = h('div', { class: 'workbench' }, sidebar())
   const main = h('div', { class: 'workbench-main' })
   if (service.draft) {
-    main.append(providerCard())
-    main.append(modelsPanel())
+    main.append(buildProviderCard())
+    main.append(buildModelsPanel())
   } else {
     main.append(emptyWorkbench())
   }
