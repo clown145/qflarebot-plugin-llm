@@ -258,3 +258,44 @@ describe('allow_http：上游只能用 IP 时的口子', () => {
     expect(isMetadataHost('[fd00::1]')).toBe(false)
   })
 })
+
+describe('纯 IPv6 地址（不只是 isPrivateHost，要过完整 checkBaseUrl）', () => {
+  const run = (url: string, allowHttp = false) => {
+    const issues: { level: string; path: string; message: string }[] = []
+    checkBaseUrl(url, 'providers.0.base_url', issues as never, { allowHttp })
+    return issues
+  }
+
+  it('公网 IPv6 + https 通过（带端口也行）', () => {
+    for (const url of [
+      'https://[2606:4700::6810:85e5]/v1',
+      'https://[2001:db8::1]/v1',
+      'https://[2a01:4f8::1]:8000/v1',
+    ]) {
+      expect(run(url), url).toEqual([])
+    }
+  })
+
+  it('公网 IPv6 + http 在 allow_http 下通过（上游是 IPv6 字面量时的唯一形态）', () => {
+    for (const url of ['http://[2400:3200::1]:8080/v1', 'http://[2606:4700:4700::1111]/v1']) {
+      expect(run(url, true), url).toEqual([])
+    }
+  })
+
+  it('公网 IPv6 + http 在没打开 allow_http 时仍拒绝', () => {
+    expect(run('http://[2400:3200::1]:8080/v1').some((i) => i.level === 'error')).toBe(true)
+  })
+
+  it('内网/回环/链路本地 IPv6 始终拒绝（即使开了 allow_http 的回环仍需元数据无关时也拒）', () => {
+    for (const url of ['https://[::1]/v1', 'https://[fd00::1]/v1', 'https://[fe80::1]/v1']) {
+      // 默认拒绝
+      expect(run(url).some((i) => i.level === 'error'), url).toBe(true)
+    }
+  })
+
+  it('IPv6 元数据/链路本地在 allow_http 下也拒绝', () => {
+    for (const url of ['http://[fd00:ec2::254]/v1', 'http://[fe80::1]/v1', 'http://[::ffff:169.254.169.254]/v1']) {
+      expect(run(url, true).some((i) => i.level === 'error' && i.message.includes('元数据')), url).toBe(true)
+    }
+  })
+})

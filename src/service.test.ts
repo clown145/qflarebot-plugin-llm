@@ -346,3 +346,30 @@ describe('发请求前的元数据地址兜底（纵深防御）', () => {
     expect(calls[0]).toContain('http://1.2.3.4:8000/v1')
   })
 })
+
+describe('纯 IPv6 上游地址的 URL 拼接', () => {
+  function ipv6Config(baseUrl: string): StoredConfig {
+    return {
+      schema_version: 1, version: 1,
+      providers: [{ id: 'p', name: 'P', protocol: 'openai', base_url: baseUrl, api_key: 'sk', enabled: true, allow_http: true }],
+      models: [{ alias: 'chat', provider: 'p', model: 'gpt-4o-mini', enabled: true }],
+      default_model: 'chat', request_timeout_ms: 15000, max_retries: 0,
+      updated_at: new Date().toISOString(),
+    }
+  }
+
+  it('IPv6 字面量带端口时，方括号与端口不能丢（丢了就请求到错误的主机）', async () => {
+    const calls: string[] = []
+    const fetchImpl = (async (url: string) => {
+      calls.push(String(url))
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+
+    const llm = client(fetchImpl, ipv6Config('http://[2400:3200::1]:8080/v1'))
+    await llm.chat({ messages: [{ role: 'user', content: 'hi' }] })
+
+    expect(calls[0]).toBe('http://[2400:3200::1]:8080/v1/chat/completions')
+  })
+})
