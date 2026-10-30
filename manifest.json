@@ -8,7 +8,16 @@
   ],
   "depends": {},
   "conflicts": [],
-  "commands": [],
+  "commands": [
+    {
+      "name": "llm",
+      "description": "查看或切换默认模型",
+      "usage": "/llm [use <序号或别名>]",
+      "aliases": [
+        "llm 模型"
+      ]
+    }
+  ],
   "regex": [],
   "events": [],
   "buttons": [],

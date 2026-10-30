@@ -15,6 +15,7 @@ import type {
 import type { ModelConfig, ProviderConfig, StoredConfig } from './config/types.js'
 import { LIMITS } from './config/types.js'
 import { listModels as listConfiguredModels, resolveProvider, resolveTarget, toResolvedModel } from './config/resolve.js'
+import { withDefaultModel } from './commands/switch.js'
 import { LLMError, errorFields, errorMessage, isAbortError } from './errors.js'
 import { mergeUsage } from './protocols/shared.js'
 import { adapterFor } from './protocols/registry.js'
@@ -314,6 +315,43 @@ export class LLM implements LLMService {
         error: errorMessage(err),
       }
     }
+  }
+
+  /**
+   * 当前默认模型的别名。
+   *
+   * 单独一个方法而不是让调用方去读配置：`default_model` 可能在配置里为空
+   * （还没设置过），那时 `resolveTarget` 会退回「第一个可用模型」。
+   * 命令层要显示「当前用的是哪个」，必须和 `chat()` 的实际行为一致，
+   * 所以这里复用同样的解析逻辑。
+   */
+  async currentModel(): Promise<string> {
+    const config = await this.requireConfig()
+    const models = listConfiguredModels(config)
+    if (models.length === 0) return ''
+    // 显式配了就用它；没配就是调用时会被选中的那个（第一个可用模型）
+    return config.default_model || models[0]!.alias
+  }
+
+  /**
+   * 切换默认模型。
+   *
+   * 只改 `default_model`，不动供应商与模型列表。
+   *
+   * **写后必须清掉配置缓存**：`load()` 用 `configPromise` 缓存了一次读，
+   * 不清的话本次请求后续的 `chat()` 还会用旧配置 —— 用户切了模型却感觉没生效。
+   */
+  async setDefaultModel(alias: string): Promise<void> {
+    const config = await this.requireConfig()
+    const models = listConfiguredModels(config)
+    if (!models.some((model) => model.alias === alias)) {
+      throw new LLMError('config', `没有名为 ${alias} 的可用模型`)
+    }
+
+    const next = withDefaultModel(config, alias)
+    await this.store.write(next)
+    // 缓存失效：下次 load() 重新读
+    this.configPromise = undefined
   }
 
   private load(): Promise<LoadedConfig> {
