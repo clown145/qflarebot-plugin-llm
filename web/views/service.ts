@@ -639,6 +639,57 @@ function contextBadge(model: ModelConfig): HTMLElement {
   return h('span', { class: 'badge', title, text: `上下文 ${formatTokenCount(model.context_window)}` })
 }
 
+/**
+ * 窄屏的供应商选择器。**只在窄屏显示**（CSS 控制），宽屏用左侧列表。
+ *
+ * 对标 AstrBot 的 `provider-sources-mobile-select`
+ * （`ProviderSourcesPanel.vue:9` + `@media (max-width: 960px)`）：
+ * 它在窄屏把左侧整个列表 `display:none`，换成一个下拉框。
+ *
+ * 为什么必须换，而不是把两栏叠成一栏：侧栏里是一个**固定 220px 高、
+ * 带内部滚动的列表**。手机上把它堆在内容上面，等于先占掉三分之一屏
+ * 才能看到表单，而且那 220px 内部滚动会和页面的整页滚动打架 ——
+ * 用户往下滑时不知道滑的是哪一层。这正是之前手机上难看的根源。
+ */
+function mobileProviderSelect(): HTMLElement | null {
+  const config = state.config
+  if (!config) return null
+
+  const select = h('select', { class: 'qb-input provider-mobile-select' }) as HTMLSelectElement
+
+  if (service.isNew && service.draft) {
+    const option = h('option', {
+      value: service.draft.id,
+      text: `${service.draft.name || '新供应商'}（未保存）`,
+      selected: true,
+    })
+    select.append(option)
+  }
+
+  for (const provider of config.providers) {
+    const selected = provider.id === service.selectedId
+    const count = config.models.filter((model) => model.provider === provider.id).length
+    select.append(
+      h('option', {
+        value: provider.id,
+        text: `${provider.name || provider.id}${count ? ` · ${count} 个别名` : ''}`,
+        selected,
+      }),
+    )
+  }
+
+  select.addEventListener('change', () => {
+    void selectProvider(select.value)
+  })
+
+  const add = h('button', { class: 'qb-btn qb-btn--sm', text: '添加', type: 'button' })
+  add.addEventListener('click', () => {
+    void addProvider()
+  })
+
+  return h('div', { class: 'provider-mobile-bar' }, select, add)
+}
+
 function serviceHead(): HTMLElement {
   const segments = h('div', { class: 'segmented', attrs: { role: 'tablist', 'aria-label': '模型服务视图' } })
   const modes: Array<{ id: Mode; label: string }> = [
@@ -1343,6 +1394,9 @@ export function renderService(container: HTMLElement, rerender: () => void): voi
     renderAliases(container)
     return
   }
+  // 窄屏用下拉选择器代替侧栏（对标 AstrBot 的 provider-sources-mobile-select）
+  const mobile = mobileProviderSelect()
+  if (mobile) container.append(mobile)
   const workspace = h('div', { class: 'workbench' }, sidebar())
   const main = h('div', { class: 'workbench-main' })
   if (service.draft) {

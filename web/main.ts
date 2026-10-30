@@ -98,13 +98,35 @@ function header(): HTMLElement {
  * 3. **方向键切换**：`role="tablist"` 下左右方向键是约定，漏了键盘用户
  *    只能用 Tab 键一个个挪。
  */
+
+/**
+ * 页内标签。对标 `QSegmented`（`packages/ui/src/components/ui/QSegmented.vue`）。
+ *
+ * ## 规范原文（MASTER.md「动效」表）
+ *
+ * > 页内标签：选中块滑过去；内容旧的淡出、新的淡入并上浮 6px
+ *
+ * 所以这里**不是**给当前 tab 改背景色 —— 而是一个绝对定位的
+ * 「指示块」用 `translateX` + `width` 滑到选中项下面。
+ *
+ * ## 关键：这个节点只创建一次，之后复用
+ *
+ * `render()` 每次都会 `clear(app)` 重建整页。如果标签栏也跟着重建，
+ * 指示块就是全新的 DOM —— 它的初始 `translateX(0)` 会重新播放一遍动画，
+ * 于是**不管切哪个 tab 都从最左边滑过来**（用户看到的就是这个 bug）。
+ *
+ * 所以标签栏缓存在 `tabBar` 里，`render()` 复用它，切 tab 时只更新
+ * 选中态和指示块位置 —— 这样动画才是「从上一项滑到下一项」。
+ */
 let tabIndicator: HTMLElement | null = null
-let tabAnimate = false
+let tabBar: HTMLElement | null = null
 let tabObserver: ResizeObserver | null = null
 
+/** 量出当前选中的 tab，把指示块移过去 */
 function measureTabIndicator(): void {
-  const root = tabIndicator?.parentElement
-  if (!root || !tabIndicator) return
+  if (!tabIndicator) return
+  const root = tabIndicator.parentElement
+  if (!root) return
   const selected = root.querySelector<HTMLElement>('[aria-selected="true"]')
   if (!selected) {
     tabIndicator.style.opacity = '0'
@@ -116,31 +138,42 @@ function measureTabIndicator(): void {
   tabIndicator.style.transform = `translateX(${selected.offsetLeft}px)`
 }
 
+/** 把选中态同步到按钮和指示块上（不重建 DOM） */
+function syncTabSelection(): void {
+  if (!tabBar) return
+  for (const button of tabBar.querySelectorAll<HTMLElement>('[role="tab"]')) {
+    const id = button.dataset['tab']
+    const active = id === state.activeTab
+    button.classList.toggle('active', active)
+    button.setAttribute('aria-selected', String(active))
+    // 只有选中的那个进 Tab 序列，其余靠方向键 —— WAI-ARIA 的标准做法
+    button.setAttribute('tabindex', active ? '0' : '-1')
+  }
+  measureTabIndicator()
+}
+
 function tabs(): HTMLElement {
+  if (tabBar) {
+    syncTabSelection()
+    return tabBar
+  }
+
   const wrappers = h('nav', { class: 'tabs' })
   // 指示块和 tab 按钮同处一个定位容器，才能用同一个坐标系
   const root = h('div', { class: 'tabs-inner', attrs: { role: 'tablist', 'aria-label': '页面分区' } })
   wrappers.append(root)
 
-  const indicator = h('span', {
-    class: 'tab-indicator',
-    attrs: { 'aria-hidden': 'true' },
-  })
+  const indicator = h('span', { class: 'tab-indicator', attrs: { 'aria-hidden': 'true' } })
   tabIndicator = indicator
   root.append(indicator)
 
   for (const tab of TABS) {
-    const active = state.activeTab === tab.id
     const button = h('button', {
-      class: `tab${active ? ' active' : ''}`,
+      class: 'tab',
       text: tab.label,
       type: 'button',
-      attrs: {
-        role: 'tab',
-        'aria-selected': String(active),
-        // 只有选中的那个进 Tab 序列，其余靠方向键 —— WAI-ARIA 的标准做法
-        tabindex: active ? '0' : '-1',
-      },
+      dataset: { tab: tab.id },
+      attrs: { role: 'tab' },
     })
     button.addEventListener('click', () => goTab(tab.id))
     root.append(button)
@@ -156,17 +189,16 @@ function tabs(): HTMLElement {
     const next = TABS[(index + step + TABS.length) % TABS.length]
     if (!next) return
     goTab(next.id)
-    // 焦点跟到新选中的 tab 上，键盘用户不会丢位置
-    const target = root.querySelector<HTMLElement>(`[role="tab"]:nth-of-type(${
-      TABS.findIndex((item) => item.id === next.id) + 1
-    })`)
+    const target = root.querySelector<HTMLElement>(`[data-tab="${next.id}"]`)
     target?.focus()
   })
 
-  // 量一次；下一帧再开动画（避免首次渲染时滑动）
-  measureTabIndicator()
+  tabBar = wrappers
+
+  // 先量位置（此时还没有 .animate，不会播放动画）
+  syncTabSelection()
+  // 下一帧再开动画：避免页面刚打开时指示块从 0 滑到第一个 tab
   requestAnimationFrame(() => {
-    tabAnimate = true
     indicator.classList.add('animate')
   })
 
@@ -199,6 +231,23 @@ function issuesBanner(): HTMLElement | null {
   return card
 }
 
+let mounted = false
+
+/**
+ * 整页重置：把缓存的标签栏丢掉，下次 `render()` 重建。
+ *
+ * `load()`（刷新、导入、保存冲突后重载）会 `clear(app)` 清空整个页面，
+ * 缓存的 `tabBar` 虽然对象还在、但已经不在 DOM 里 —— 不重置的话
+ * `render()` 会把一个游离节点 append 回去，事件监听和指示块位置全错。
+ */
+function resetPageCache(): void {
+  tabBar = null
+  tabIndicator = null
+  tabObserver?.disconnect()
+  tabObserver = null
+  mounted = false
+}
+
 function render(): void {
   const app = document.getElementById('app')
   if (!app) return
@@ -207,10 +256,28 @@ function render(): void {
     app.append(h('div', { class: 'fatal', text: '还没有加载到配置' }))
     return
   }
-  clear(app)
-  app.append(header(), tabs())
+  // 首次渲染建整页；之后只替换「内容区」，标签栏和页头保持不动。
+  //
+  // 为什么不能整页重建：`clear(app)` 会把标签栏从 DOM 摘掉，
+  // 指示块的 offsetLeft 立刻变 0 —— 下一帧量位置就量错了，
+  // 表现就是「不管切哪个 tab 都从最左边滑过来」。
+  if (!mounted) {
+    clear(app)
+    app.append(header(), tabs())
+    mounted = true
+  } else {
+    // 标签栏复用了，但选中态要跟着 state 走 —— 否则点了没反应
+    syncTabSelection()
+  }
+
+  // 每次换掉上一次的内容区（横幅 + 面板），标签栏留在原地
+  app.querySelector('.tab-content')?.remove()
+  app.querySelector('.issues-banner')?.remove()
   const banner = issuesBanner()
-  if (banner) app.append(banner)
+  if (banner) {
+    banner.classList.add('issues-banner')
+    app.append(banner)
+  }
   // 内容区包一层：切换时给它一个入场动画（规范：旧的淡出、新的淡入并上浮 6px）。
   //
   // 为什么只做「新内容入场」不做「旧内容离场」：旧内容是在 `clear(app)` 里
@@ -235,6 +302,7 @@ function render(): void {
 
 async function load(): Promise<void> {
   const app = document.getElementById('app')
+  resetPageCache()
   if (app) {
     clear(app)
     app.append(h('div', { class: 'fatal', text: '加载中…' }))
@@ -249,6 +317,7 @@ async function load(): Promise<void> {
     resetSettingsDraft()
     render()
   } catch (err) {
+    resetPageCache()
     if (app) {
       clear(app)
       app.append(

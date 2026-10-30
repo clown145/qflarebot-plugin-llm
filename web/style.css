@@ -597,6 +597,28 @@ dialog::backdrop {
   box-shadow: var(--qb-shadow);
 }
 
+/*
+ * 窄屏的供应商选择器。宽屏隐藏（用左侧列表），窄屏反之。
+ * 对标 AstrBot 的 provider-sources-mobile-select。
+ */
+.provider-mobile-bar {
+  display: none;
+  gap: var(--qb-space-2);
+  align-items: center;
+  margin-bottom: var(--qb-space-3);
+}
+
+.provider-mobile-bar .provider-mobile-select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 按钮不能被挤成竖排文字 */
+.provider-mobile-bar .qb-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .workbench {
   display: grid;
   grid-template-columns: 250px minmax(0, 1fr);
@@ -1207,17 +1229,28 @@ details.advanced .desc {
   margin-top: var(--qb-space-2);
 }
 
+/*
+ * 窄屏（≤860px）：左侧供应商列表**整个隐藏**，改用下拉选择器。
+ *
+ * 对标 AstrBot 的 `@media (max-width: 960px)`：`provider-sources-list`
+ * 直接 `display:none`，换成 `provider-sources-mobile-select`。
+ *
+ * 为什么不把两栏叠成一栏：侧栏是固定高度 + 内部滚动的列表，堆上去会
+ * 先占掉三分之一屏，且内部滚动和整页滚动打架 —— 手机上最难用的就是这个。
+ */
 @media (max-width: 860px) {
   .workbench {
     grid-template-columns: 1fr;
   }
 
+  /* 侧栏整个不显示（宽屏才用） */
   .side-card {
-    position: static;
+    display: none;
   }
 
-  .provider-list {
-    max-height: 220px;
+  /* 窄屏显示下拉选择器 */
+  .provider-mobile-bar {
+    display: flex;
   }
 }
 
