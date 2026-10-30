@@ -106,6 +106,19 @@ export interface ChatRequest {
   max_tokens?: number
   top_p?: number
   stop?: string | string[]
+  /**
+   * 思考等级（推理深度）。不传则用模型配置里的 `reasoning_effort`；
+   * 两边都没有就不干预，交给上游默认值。
+   *
+   * 这是**跨协议的公共词汇**，各协议翻译成自己的形状：
+   * - OpenAI 兼容 → `reasoning_effort`
+   * - Anthropic → `thinking.budget_tokens`
+   * - Gemini 2.5 → `thinkingConfig.thinkingBudget`；3.x → `thinkingLevel`
+   *
+   * 注意：不是所有模型都支持。不支持的上游有的静默忽略、有的报错，
+   * 所以只在显式配置时才发送（见 protocols/thinking.ts）。
+   */
+  reasoning_effort?: 'minimal' | 'low' | 'medium' | 'high'
   /** 要求 JSON 对象输出；Anthropic 协议不支持，会抛 unsupported */
   json?: boolean
   /**
@@ -165,6 +178,8 @@ export interface ModelInfo {
   max_output_tokens?: number
   max_tokens?: number
   temperature?: number
+  /** 该模型配置的默认思考等级；没配时不返回 */
+  reasoning_effort?: 'minimal' | 'low' | 'medium' | 'high'
 }
 
 export interface ResolvedModel extends ModelInfo {

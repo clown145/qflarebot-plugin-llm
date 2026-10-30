@@ -406,6 +406,11 @@ export class LLM implements LLMService {
     if (effective.max_tokens === undefined && maxTokens !== undefined && Number.isInteger(maxTokens) && maxTokens > 0) {
       effective.max_tokens = maxTokens
     }
+    // 思考等级：请求显式传的优先，否则用模型配置里的默认值。
+    // 与 temperature / max_tokens 同一套「模型默认值」语义。
+    if (effective.reasoning_effort === undefined && target.model.reasoning_effort !== undefined) {
+      effective.reasoning_effort = target.model.reasoning_effort
+    }
 
     // 工具名合法化：插件用 `time.now` 这种可读名字，而上游只收 `[a-zA-Z0-9_-]`
     // （OpenAI 兼容含 DeepSeek 会直接 400）。映射按本次请求出现的名字建立，

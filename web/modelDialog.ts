@@ -1,6 +1,6 @@
 import type { Capability } from '../src/contract.js'
 import type { ModelConfig, ProtocolId } from '../src/config/types.js'
-import { CAPABILITY_VALUES, capabilitiesOf } from '../src/config/types.js'
+import { CAPABILITY_VALUES, REASONING_EFFORTS, capabilitiesOf, type ReasoningEffort } from '../src/config/types.js'
 import type { MetadataField, MetadataResolution, ModelCatalog } from '../src/modelMetadata.js'
 import { resolveModelMetadata, withMetadata } from '../src/modelMetadata.js'
 import { toast } from './api.js'
@@ -19,6 +19,13 @@ const LABELS: Record<Capability, string> = {
   tools: '工具',
   json: 'JSON',
   reasoning: '推理',
+}
+
+const EFFORT_LABELS: Record<ReasoningEffort, string> = {
+  minimal: '很浅（几乎不思考）',
+  low: '浅',
+  medium: '中',
+  high: '深',
 }
 
 const FIELD_LABELS: Record<MetadataField, string> = {
@@ -95,6 +102,12 @@ export function openModelDialog(options: ModelDialogOptions): void {
   const maxOutput = h('input', { type: 'number', attrs: { min: '1', max: '1000000', step: '1' }, value: draft.max_output_tokens ?? '', placeholder: '如 8192' })
   const maxTokens = h('input', { type: 'number', attrs: { min: '1', max: '131072', step: '1' }, value: draft.max_tokens ?? '', placeholder: '默认' })
   const temperature = h('input', { type: 'number', attrs: { min: '0', max: '2', step: '0.1' }, value: draft.temperature ?? '', placeholder: '默认' })
+  // 思考等级：留空 = 不干预（不发任何推理参数），交给上游默认值
+  const effort = h('select')
+  effort.append(h('option', { value: '', text: '不干预（用上游默认）' }))
+  for (const value of REASONING_EFFORTS) {
+    effort.append(h('option', { value, text: EFFORT_LABELS[value], selected: draft.reasoning_effort === value }))
+  }
   const enabled = switchControl(draft.enabled)
   const capBox = h('div', { class: 'chip-row' })
 
@@ -336,6 +349,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
           { class: 'grid' },
           field('默认 max_tokens', maxTokens, '调用方不传时使用，可被覆盖'),
           field('默认温度', temperature, '0–2，留空用上游默认'),
+          field('思考等级', effort, '深度推理用的预算；留空不干预。各协议自动换算'),
         ),
       ),
       h('div', { class: 'switch-row' }, switchLabel(enabled, '启用这个别名')),
@@ -412,6 +426,8 @@ export function openModelDialog(options: ModelDialogOptions): void {
           }
           if (tokens !== undefined) next.max_tokens = tokens
           if (temp !== undefined) next.temperature = temp
+          // 空选项 = 不干预：不给字段，而不是给 undefined（JSON 往返时会丢）
+          if (effort.value) next.reasoning_effort = effort.value as ReasoningEffort
           if (context !== undefined) next.context_window = context
           if (output !== undefined) next.max_output_tokens = output
 

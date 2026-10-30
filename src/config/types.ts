@@ -35,6 +35,30 @@ export interface ModelConfig {
   /** 默认请求输出上限；和模型自身上限 max_output_tokens 不是一回事 */
   max_tokens?: number
   temperature?: number
+  /**
+   * 思考等级（推理深度）。不填 = 不干预，交给上游模型的默认值。
+   *
+   * ## 为什么是「等级」而不是「token 预算」
+   *
+   * 三个协议对「想多深」的表达方式完全不同，同一协议内还随模型世代变化：
+   *
+   * | 协议 | 字段 | 取值 |
+   * | --- | --- | --- |
+   * | OpenAI 兼容 | `reasoning_effort` | minimal / low / medium / high |
+   * | Anthropic | `thinking.budget_tokens` | 具体 token 数（≥1024） |
+   * | Gemini 2.5 | `thinkingConfig.thinkingBudget` | 具体 token 数 |
+   * | Gemini 3.x | `thinkingConfig.thinkingLevel` | minimal / low / medium / high |
+   *
+   * 让用户在页面上填 token 数既难懂又不可移植（换模型就得重算），所以统一成
+   * **四个语义等级**，由各协议适配器翻译成自己的形状。换算表见 `protocols/thinking.ts`。
+   *
+   * ## 为什么放在模型配置里
+   *
+   * 它与 `temperature` / `max_tokens` 同类：都是「这个模型的默认生成参数」，
+   * 调用方不传就用这里的值。放这里之后，「快问快答模型」和「深度推理模型」
+   * 可以各自配各自的等级。
+   */
+  reasoning_effort?: ReasoningEffort
   /** 输入上下文上限（tokens） */
   context_window?: number
   /** 模型输出上限（tokens） */
@@ -43,6 +67,17 @@ export interface ModelConfig {
   capabilities?: Capability[]
   enabled: boolean
 }
+
+/**
+ * 思考等级。语义对齐 OpenAI 的 `reasoning_effort`，作为跨协议的公共词汇。
+ *
+ * `minimal` 在 Anthropic / Gemini 上没有直接对应物，会退化成「明确关闭思考」
+ * 或最小预算——见 `protocols/thinking.ts` 的映射表。
+ */
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high'
+
+/** 面板显示顺序：从浅到深 */
+export const REASONING_EFFORTS: ReasoningEffort[] = ['minimal', 'low', 'medium', 'high']
 
 export interface StoredConfig {
   schema_version: 1

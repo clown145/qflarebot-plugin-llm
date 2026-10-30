@@ -20,6 +20,7 @@ export function modelInfo(provider: ProviderConfig, model: ModelConfig): ModelIn
     ...(model.max_output_tokens !== undefined ? { max_output_tokens: model.max_output_tokens } : {}),
     ...(model.max_tokens !== undefined ? { max_tokens: model.max_tokens } : {}),
     ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),
+    ...(model.reasoning_effort !== undefined ? { reasoning_effort: model.reasoning_effort } : {}),
   }
 }
 

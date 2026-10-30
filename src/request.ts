@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatRequest, ContentPart, MessageContent, ToolChoice } from './contract.js'
+import { REASONING_EFFORTS } from './config/types.js'
 import { LLMError } from './errors.js'
 import { isRecord } from './json.js'
 
@@ -167,6 +168,9 @@ export function validateChatRequest(request: ChatRequest): void {
   }
   if (request.timeout_ms !== undefined && (typeof request.timeout_ms !== 'number' || request.timeout_ms <= 0)) {
     bad('timeout_ms 必须是正数')
+  }
+  if (request.reasoning_effort !== undefined && !(REASONING_EFFORTS as string[]).includes(request.reasoning_effort)) {
+    bad(`reasoning_effort 只能是 ${REASONING_EFFORTS.join(' / ')}`)
   }
   if (request.stop !== undefined) {
     const stop = request.stop

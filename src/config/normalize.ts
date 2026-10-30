@@ -1,5 +1,5 @@
 import type { Capability } from '../contract.js'
-import type { ModelConfig, ProtocolId, ProviderConfig, StoredConfig } from './types.js'
+import type { ModelConfig, ProtocolId, ProviderConfig, ReasoningEffort, StoredConfig } from './types.js'
 import { CAPABILITY_VALUES, LIMITS } from './types.js'
 import { DEFAULT_TIMEOUT_MS } from './defaults.js'
 
@@ -28,6 +28,20 @@ function stringMap(value: unknown): Record<string, string> | undefined {
 
 const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/
 const MODEL_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,39}$/
+
+/**
+ * 思考等级窄化。
+ *
+ * **保留非法字符串**（只挡非字符串与空串），而不是静默改成 undefined：
+ * 与本文件顶部「不静默丢非法值」的原则一致——如果用户手改 KV 写了个 `"highest"`，
+ * 悄悄当成「没配」会让人以为生效了。保留下来后 `validateConfig` 会报错并拦住保存；
+ * 若真被带进运行时，`protocols/thinking.ts` 对未知值是查不到的，会退化成不干预（安全侧）。
+ */
+function reasoningEffort(value: unknown): ReasoningEffort | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed ? (trimmed as ReasoningEffort) : undefined
+}
 
 export function normalizeProvider(raw: unknown, index: number): ProviderConfig {
   const item = isRecord(raw) ? raw : {}
@@ -73,12 +87,14 @@ export function normalizeModel(raw: unknown): ModelConfig {
   const contextWindow = numberOrUndefined(item['context_window'])
   const maxOutput = numberOrUndefined(item['max_output_tokens'])
   const caps = capabilities(item['capabilities'])
+  const effort = reasoningEffort(item['reasoning_effort'])
   return {
     alias: text(item['alias']),
     provider: text(item['provider']),
     model: text(item['model']),
     ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
     ...(temperature !== undefined ? { temperature } : {}),
+    ...(effort ? { reasoning_effort: effort } : {}),
     ...(contextWindow !== undefined ? { context_window: contextWindow } : {}),
     ...(maxOutput !== undefined ? { max_output_tokens: maxOutput } : {}),
     ...(caps ? { capabilities: caps } : {}),

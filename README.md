@@ -13,6 +13,7 @@ QFlareBot 的 LLM 接口插件：提供供应商与模型配置页，并通过 `
 - 工具定义与工具调用结果透传，由调用方执行工具。
 - 多模态输入：文本、图片（OpenAI 兼容 / Anthropic）、音频（OpenAI 兼容）、文件（Anthropic）。
 - 推理内容透传：DeepSeek `reasoning_content` 与 Anthropic thinking block 通过 `reasoning` / `reasoning_delta` 返回。
+- 思考等级：按模型配置推理深度（很浅/浅/中/深），自动换算成 OpenAI `reasoning_effort`、Anthropic `budget_tokens`、Gemini `thinkingBudget`/`thinkingLevel`。
 - 独立的配置页面，支持供应商/模型增删改、启停、连通性测试、拉取上游模型、导入导出。
 - API Key 仅保存在插件 KV 中，页面不回显；导出文件不包含 Key 和任何可能带密钥的请求头。
 
@@ -110,6 +111,30 @@ https://[2606:4700::6810:85e5]/v1
 - 手动修改优先于目录值；自动查询只填充空字段。模型弹窗里的「重新获取」也只填空字段；要覆盖已有值，用「按来源填充」。
 - 同名模型出现在多个供应商下时，只自动填入各来源一致的字段；上下文、输出上限或能力冲突时留空，并在模型弹窗里提示选择来源或手动填写。
 - 指定供应商时优先使用该供应商的目录数据；供应商不在目录里时退回全部同名候选。
+
+### 思考等级（推理深度）
+
+在模型弹窗的「请求默认值」里可以给一个模型设置**思考等级**，控制推理模型「想多深」。
+它是模型级的默认值，和 `temperature`、`max_tokens` 同类：调用方不传就用它。
+留空 = 不干预，交给上游模型的默认行为。
+
+四个等级：**很浅 / 浅 / 中 / 深**。之所以给语义等级而不是让用户填 token 数，
+是因为三个协议的表达方式完全不同，而且同一协议还随模型世代变化：
+
+| 协议 | 实际发出的字段 | 换算 |
+| --- | --- | --- |
+| OpenAI 兼容 | `reasoning_effort` | 等级名原样透传 |
+| Anthropic | `thinking: { type: 'enabled', budget_tokens }` | 很浅不发字段；浅/中/深 = 1024/4096/8192 |
+| Gemini 2.5 | `generationConfig.thinkingConfig.thinkingBudget` | 很浅=0（关闭）、浅/中/深 = 1024/4096/8192 |
+| Gemini 3.x | `generationConfig.thinkingConfig.thinkingLevel` | `MINIMAL` / `LOW` / `MEDIUM` / `HIGH` |
+
+几个要留意的点：
+
+- **只在显式配置时才发送**。没配就完全不带这些字段，对「不认它的兼容网关」零影响。
+- **Anthropic 会自动抬高 `max_tokens`**。它要求 `budget_tokens < max_tokens`，而且思考与正文**共享**输出预算；所以开启思考时 `max_tokens` 至少被抬到预算的两倍（一半想、一半说），否则正文会被截断或直接 400。
+- **Gemini 按模型名二选一**：`gemini-2.5-*` 用 `thinkingBudget`，`gemini-3-*` / `gemini-3.*` 用 `thinkingLevel`。混用会 400。
+- **不是所有模型都支持**。不支持的上游有的静默忽略、有的报错。模型能力里勾了「推理」不代表上游一定认，配之前建议先在「概览」里测一次。
+- 思考内容本身仍然通过 `reasoning` / `reasoning_delta` 返回，且不回传到后续请求（Anthropic 的 thinking 签名无法重建）。
 
 ## 服务接口
 

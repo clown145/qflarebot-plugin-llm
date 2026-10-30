@@ -14,6 +14,7 @@ import {
   textOf,
   toParts,
 } from './shared.js'
+import * as thinking from './thinking.js'
 
 const VERSION = '2023-06-01'
 
@@ -206,14 +207,28 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
   if (target.provider.api_key) headers['x-api-key'] = target.provider.api_key
 
   const mapped = mapMessages(request.messages)
+  // 思考等级：Anthropic 用 `thinking.budget_tokens` 表达，没有等级枚举。
+  const effort = thinking.effectiveEffort(request, target.model)
+  const thinkingConfig = thinking.anthropicThinking(effort)
   // max_tokens 必填：请求值 → 模型配置的输出上限 → 兜底 4096（旧实现的 1024 会静默截断长回答）
-  const maxTokens = request.max_tokens ?? target.model.max_output_tokens ?? DEFAULT_MAX_TOKENS
+  let maxTokens = request.max_tokens ?? target.model.max_output_tokens ?? DEFAULT_MAX_TOKENS
+  if (thinkingConfig) {
+    // **硬性约束**：Anthropic 要求 `budget_tokens < max_tokens`，否则直接
+    //   400 "thinking.budget_tokens: max_tokens must be greater than budget_tokens"
+    // 而且 thinking 与正文**共享**同一个输出预算，贴着上限会只剩几十 token 写正文。
+    // 所以这里把 max_tokens 抬到「预算 + 一倍预算」：一半想、一半说。
+    // 用户显式配了更大的 max_tokens 就尊重它（只保证严格大于预算）。
+    const minimum = thinkingConfig.budget_tokens * 2
+    if (maxTokens < minimum) maxTokens = minimum
+  }
   const body: Record<string, unknown> = {
     ...(request.extra_body ?? {}),
     model: target.model.model,
     max_tokens: maxTokens,
     messages: mapped.messages,
   }
+  // 调用方自己通过 extra_body 传了 thinking 就以它为准；否则用等级翻译出来的值。
+  if (thinkingConfig && body['thinking'] === undefined) body['thinking'] = thinkingConfig
   if (mapped.system) body['system'] = mapped.system
   if (request.temperature !== undefined) body['temperature'] = request.temperature
   if (request.top_p !== undefined) body['top_p'] = request.top_p

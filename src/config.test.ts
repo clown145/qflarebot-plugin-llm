@@ -43,6 +43,24 @@ describe('normalizeConfig', () => {
     expect(config.version).toBe(1)
   })
 
+  it('reasoning_effort 保留；非法值也保留下来交给校验层报错（不静默抹掉）', () => {
+    const good = normalizeConfig({
+      providers: [{ id: 'p', protocol: 'openai', base_url: 'https://api.test/v1' }],
+      models: [{ alias: 'a', provider: 'p', model: 'm', reasoning_effort: ' high ' }],
+    })
+    expect(good.models[0]?.reasoning_effort).toBe('high')
+    const bad = normalizeConfig({
+      providers: [{ id: 'p', protocol: 'openai', base_url: 'https://api.test/v1' }],
+      models: [{ alias: 'a', provider: 'p', model: 'm', reasoning_effort: 'highest' }],
+    })
+    expect(bad.models[0]?.reasoning_effort).toBe('highest')
+    const empty = normalizeConfig({
+      providers: [{ id: 'p', protocol: 'openai', base_url: 'https://api.test/v1' }],
+      models: [{ alias: 'a', provider: 'p', model: 'm', reasoning_effort: '   ' }],
+    })
+    expect(empty.models[0]?.reasoning_effort).toBeUndefined()
+  })
+
   it('模型元数据字段保留，能力去重并补 text', () => {
     const config = normalizeConfig({
       providers: [{ id: 'p', protocol: 'openai', base_url: 'https://api.test/v1' }],
@@ -141,6 +159,31 @@ describe('validateConfig', () => {
     expect(errors.some((item) => item.path.endsWith('context_window'))).toBe(true)
     expect(errors.some((item) => item.path.endsWith('max_output_tokens'))).toBe(true)
     expect(errors.some((item) => item.path.endsWith('capabilities'))).toBe(true)
+  })
+})
+
+describe('validateConfig：思考等级', () => {
+  it('非法等级报 error（会被保存前拦截）', () => {
+    const config = sample()
+    config.models[0]!.reasoning_effort = 'highest' as never
+    const issues = validateConfig(config)
+    expect(issues).toContainEqual(
+      expect.objectContaining({ level: 'error', path: 'models.0.reasoning_effort' }),
+    )
+  })
+
+  it('合法等级不报 error', () => {
+    const config = sample()
+    config.models[0]!.reasoning_effort = 'medium'
+    const issues = validateConfig(config).filter((item) => item.path === 'models.0.reasoning_effort')
+    expect(issues.filter((item) => item.level === 'error')).toEqual([])
+  })
+
+  it('OpenAI 模型没声明 reasoning 能力时只提醒，不拦', () => {
+    const config = sample()
+    config.models[0]!.reasoning_effort = 'high'
+    const issues = validateConfig(config).filter((item) => item.path === 'models.0.reasoning_effort')
+    expect(issues.every((item) => item.level === 'warn')).toBe(true)
   })
 })
 

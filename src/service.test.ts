@@ -373,3 +373,68 @@ describe('纯 IPv6 上游地址的 URL 拼接', () => {
     expect(calls[0]).toBe('http://[2400:3200::1]:8080/v1/chat/completions')
   })
 })
+
+describe('思考等级在服务层的装配', () => {
+  /** 抓一次 chat 调用实际发出的请求体 */
+  async function capturedBody(value: StoredConfig, request: Partial<Parameters<LLM['chat']>[0]> = {}): Promise<Record<string, unknown>> {
+    let body: Record<string, unknown> = {}
+    const anthropic = value.providers[0]?.protocol === 'anthropic'
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      body = JSON.parse(String(init.body)) as Record<string, unknown>
+      // 响应形状要跟协议一致，否则解析层会先报「上游没有返回内容」
+      return jsonResponse(
+        anthropic
+          ? { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }
+          : { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] },
+      )
+    })
+    await client(fetchMock as unknown as typeof fetch, value).chat({
+      model: 'chat',
+      messages: [{ role: 'user', content: 'hi' }],
+      ...request,
+    } as Parameters<LLM['chat']>[0])
+    return body
+  }
+
+  it('模型配置里的 reasoning_effort 会自动带上（调用方不用传）', async () => {
+    const value = config()
+    value.models[0]!.reasoning_effort = 'high'
+    expect((await capturedBody(value))['reasoning_effort']).toBe('high')
+  })
+
+  it('请求里显式传的等级覆盖模型默认值', async () => {
+    const value = config()
+    value.models[0]!.reasoning_effort = 'low'
+    expect((await capturedBody(value, { reasoning_effort: 'high' }))['reasoning_effort']).toBe('high')
+  })
+
+  it('模型没配、请求也没传时，请求体里不出现该字段', async () => {
+    const body = await capturedBody(config())
+    expect('reasoning_effort' in body).toBe(false)
+  })
+
+  it('Anthropic 走 thinking 字段而不是 reasoning_effort', async () => {
+    const value = anthropicConfig()
+    value.models[0]!.reasoning_effort = 'medium'
+    const body = await capturedBody(value)
+    expect(body['thinking']).toMatchObject({ type: 'enabled' })
+    expect(body['reasoning_effort']).toBeUndefined()
+    // budget < max_tokens 的硬性约束
+    const thinking = body['thinking'] as { budget_tokens: number }
+    expect(body['max_tokens'] as number).toBeGreaterThan(thinking.budget_tokens)
+  })
+
+  it('非法的 reasoning_effort 会被拒绝，不会静默发出去', async () => {
+    const value = config()
+    const fetchMock = vi.fn()
+    await expect(
+      client(fetchMock as unknown as typeof fetch, value).chat({
+        model: 'chat',
+        messages: [{ role: 'user', content: 'hi' }],
+        // 绕过类型，模拟老页面 / 手改 KV 传来的脏值
+        reasoning_effort: 'highest' as never,
+      }),
+    ).rejects.toMatchObject({ code: 'bad_request' })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})

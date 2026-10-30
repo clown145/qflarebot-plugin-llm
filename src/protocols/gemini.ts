@@ -4,6 +4,7 @@ import { LLMError } from '../errors.js'
 import { asArray, asNumber, asString, isRecord } from '../json.js'
 import { readSSE } from '../sse.js'
 import { streamError, type UpstreamContext } from '../upstream.js'
+import * as thinking from './thinking.js'
 import type { BuiltRequest, ParsedResponse, ParsedStreamEvent, ProtocolAdapter, StreamContext, Target } from './types.js'
 import { endpointUrl, mergeUsage, toParts, textOf } from './shared.js'
 
@@ -269,19 +270,34 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
 
   const mapped = mapMessages(request.messages)
   const maxTokens = request.max_tokens ?? target.model.max_output_tokens ?? DEFAULT_MAX_TOKENS
+  const extra = request.extra_body ?? {}
+  // 思考等级：Gemini 按模型世代二选一（2.5 用 thinkingBudget / 3.x 用 thinkingLevel）。
+  const effort = thinking.effectiveEffort(request, target.model)
+  const thinkingConfig = thinking.geminiThinkingConfig(effort, target.model.model)
+  const extraGeneration = isRecord(extra['generationConfig']) ? extra['generationConfig'] : {}
   const body: Record<string, unknown> = {
-    ...(request.extra_body ?? {}),
+    ...extra,
     // 不写 `model`：模型名已经在 URL 路径里（`/models/{model}:generateContent`），
     // 请求体没有这个字段。官方端点对多余字段是「能忽略就忽略」，但流式端点对
     // 未知字段直接 400（见上面对 `stream` 的说明），所以不给自己留隐患。
     contents: mapped.contents,
+    // `generationConfig` 必须与 `extra_body` 里的同名对象**深合并**。
+    //
+    // 浅展开会把整个 `generationConfig` 覆盖掉：调用方通过 `extra_body` 传的
+    // `thinkingConfig` / `responseMimeType` 等字段会静默消失，而且不报错——
+    // 只有直连官方端点比对请求体才能发现。其余字段（tools、systemInstruction 等）
+    // 是这层自己的，仍按「extra_body 优先、随后被权威值覆盖」处理。
     generationConfig: {
+      ...extraGeneration,
       maxOutputTokens: maxTokens,
       ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
       ...(request.top_p !== undefined ? { topP: request.top_p } : {}),
       ...(request.stop !== undefined
         ? { stopSequences: Array.isArray(request.stop) ? request.stop : [request.stop] }
         : {}),
+      // 同理，`thinkingConfig` 也要按字段合并：调用方可能只想改 `includeThoughts`
+      ...(isRecord(extraGeneration['thinkingConfig']) ? { thinkingConfig: extraGeneration['thinkingConfig'] } : {}),
+      ...(thinkingConfig && !isRecord(extraGeneration['thinkingConfig']) ? { thinkingConfig } : {}),
     },
   }
   if (mapped.system) body['systemInstruction'] = { parts: [{ text: mapped.system }] }

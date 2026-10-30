@@ -4,6 +4,7 @@ import { LLMError } from '../errors.js'
 import { asArray, asNumber, asString, isRecord } from '../json.js'
 import { readSSE } from '../sse.js'
 import { streamError, type UpstreamContext } from '../upstream.js'
+import * as thinking from './thinking.js'
 import type { BuiltRequest, ParsedResponse, ParsedStreamEvent, ProtocolAdapter, StreamContext, Target } from './types.js'
 import {
   endpointUrl,
@@ -153,6 +154,15 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
   if (request.top_p !== undefined) body['top_p'] = request.top_p
   if (request.stop !== undefined) body['stop'] = request.stop
   if (request.json) body['response_format'] = { type: 'json_object' }
+  // 思考等级：只在**显式配了**才发，没配就完全不出现这个字段。
+  //
+  // 这样对「不认 reasoning_effort 的兼容网关」保持零影响——它们有的静默忽略、
+  // 有的直接 400，不发送就等于什么都没改。
+  // 若调用方已通过 extra_body 自己写了 reasoning_effort，以调用方为准（它更具体）。
+  const effortValue = thinking.openAIReasoningEffort(thinking.effectiveEffort(request, target.model))
+  if (effortValue !== undefined && body['reasoning_effort'] === undefined) {
+    body['reasoning_effort'] = effortValue
+  }
   if (request.tools?.length) {
     body['tools'] = mapTools(request.tools)
     if (request.tool_choice) body['tool_choice'] = mapToolChoice(request.tool_choice)

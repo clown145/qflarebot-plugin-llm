@@ -514,3 +514,50 @@ describe('并发保存', () => {
     expect((JSON.parse(stored) as StoredConfig).version).toBe(1)
   })
 })
+
+
+describe('思考等级的存取链路', () => {
+  function putBody(config: StoredConfig, models: StoredConfig['models']): unknown {
+    return {
+      version: config.version,
+      config: {
+        providers: config.providers,
+        models,
+        default_model: config.default_model,
+        request_timeout_ms: config.request_timeout_ms,
+        max_retries: config.max_retries,
+      },
+    }
+  }
+
+  it('reasoning_effort 原样落盘，GET 时原样返回', async () => {
+    const seed = sample()
+    const ctx = await seeded(seed)
+    const response = await call('/api/config', 'PUT', {
+      ctx,
+      body: putBody(seed, [{ ...seed.models[0]!, reasoning_effort: 'high' }]),
+    })
+    expect(response.status).toBe(200)
+
+    const view = await call('/api/config', 'GET', { ctx })
+    const data = (await view.json()) as { config: StoredConfig }
+    expect(data.config.models[0]?.reasoning_effort).toBe('high')
+  })
+
+  it('提交非法等级时被 400 拦下，存储里的旧值不变', async () => {
+    const seed = sample()
+    seed.models[0]!.reasoning_effort = 'low'
+    const ctx = await seeded(seed)
+    const response = await call('/api/config', 'PUT', {
+      ctx,
+      // 故意传脏值，模拟老页面/手改请求
+      body: putBody(seed, [{ ...seed.models[0]!, reasoning_effort: 'highest' as never }]),
+    })
+    expect(response.status).toBe(400)
+
+    const view = await call('/api/config', 'GET', { ctx })
+    const data = (await view.json()) as { config: StoredConfig }
+    // 旧值没被脏数据覆盖
+    expect(data.config.models[0]?.reasoning_effort).toBe('low')
+  })
+})

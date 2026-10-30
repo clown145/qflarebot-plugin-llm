@@ -1,5 +1,5 @@
 import { looksLikeSecret } from '../redact.js'
-import { CAPABILITY_VALUES, LIMITS, type ConfigIssue, type StoredConfig } from './types.js'
+import { CAPABILITY_VALUES, LIMITS, REASONING_EFFORTS, type ConfigIssue, type StoredConfig } from './types.js'
 
 const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/
 const MODEL_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,39}$/
@@ -328,6 +328,20 @@ export function validateConfig(config: StoredConfig): ConfigIssue[] {
     }
     if (model.temperature !== undefined && (typeof model.temperature !== 'number' || model.temperature < 0 || model.temperature > 2)) {
       issues.push(issue('error', `${base}.temperature`, '应在 0–2 之间'))
+    }
+    if (model.reasoning_effort !== undefined) {
+      if (!(REASONING_EFFORTS as string[]).includes(model.reasoning_effort)) {
+        // 报错并拦住保存：非法等级在运行时会退化成「不干预」，等于用户配了却没生效
+        issues.push(
+          issue('error', `${base}.reasoning_effort`, `只能是 ${REASONING_EFFORTS.join(' / ')}`),
+        )
+      } else if (provider?.protocol === 'openai' && !model.capabilities?.includes('reasoning')) {
+        // 不是硬错误：很多兼容网关不声明 capabilities，但确实认 reasoning_effort。
+        // 只提醒一下，避免用户以为「配了就一定有效」
+        issues.push(
+          issue('warn', `${base}.reasoning_effort`, '模型能力里没有「推理」；若上游不支持该字段，会被忽略或报错'),
+        )
+      }
     }
   })
 
