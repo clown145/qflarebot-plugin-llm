@@ -40,9 +40,12 @@ describe('gemini.buildChat', () => {
     }, false)
     const body = JSON.parse(built.init.body as string)
     expect((built.init.headers as Record<string, string>)['x-goog-api-key']).toBe('g-key')
-    expect(built.url).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent'.replace('models/gemini-2.5-flash', '').length > 0
-      ? 'https://generativelanguage.googleapis.com/v1beta:generateContent'
-      : '')
+    // 官方形态是 {base}/models/{model}:generateContent，模型名必须在路径里。
+    // 这条断言以前写成了「把期望值绕一圈断言回错误实现的结果」，于是
+    // `/v1beta:generateContent`（缺 /models/{model}，必然 404）一直被当成正确值。
+    expect(built.url).toBe(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+    )
     expect(body.systemInstruction).toEqual({ parts: [{ text: '规则' }] })
     expect(body.contents).toEqual([{ role: 'user', parts: [{ text: '你好' }] }])
     expect(body.generationConfig.maxOutputTokens).toBe(8192)
@@ -428,5 +431,56 @@ describe('gemini thoughtSignature（Gemini 2.5/3.x 强制要求回传）', () =>
     const modelContent = body.contents.find((item: { role: string }) => item.role === 'model')
     expect(modelContent.parts[0].thoughtSignature).toBe('sig-t')
     expect(modelContent.parts[1].thoughtSignature).toBe('sig-c')
+  })
+})
+
+describe('gemini 的 generateContent 地址拼接', () => {
+  const target2 = (base_url: string, model = 'gemini-3-flash') => ({
+    provider: { id: 'p', name: 'P', protocol: 'gemini' as const, base_url, enabled: true },
+    model: { alias: 'chat', provider: 'p', model, enabled: true },
+  })
+  const urlOf = (base_url: string, model?: string, stream = false) =>
+    gemini.buildChat(target2(base_url, model), { messages: [{ role: 'user', content: 'hi' }] }, stream).url
+
+  it('常规 base_url：补 /models/{model}:generateContent（模型名必须在路径里）', () => {
+    expect(urlOf('https://generativelanguage.googleapis.com/v1beta')).toBe(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent',
+    )
+  })
+
+  it('流式换成 streamGenerateContent 并带 alt=sse', () => {
+    expect(urlOf('https://host/v1beta', undefined, true)).toBe(
+      'https://host/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse',
+    )
+  })
+
+  it('base_url 已经写到 models/{model}：只补方法后缀，不重复拼', () => {
+    expect(urlOf('https://host/v1beta/models/gemini-3-flash')).toBe(
+      'https://host/v1beta/models/gemini-3-flash:generateContent',
+    )
+  })
+
+  it('base_url 是完整端点：原样用；流式要换成 streamGenerateContent', () => {
+    const full = 'https://host/v1beta/models/gemini-3-flash:generateContent'
+    expect(urlOf(full)).toBe(full)
+    expect(urlOf(full, undefined, true)).toBe(
+      'https://host/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse',
+    )
+  })
+
+  it('模型名带 models/ 前缀时不会拼出 /models/models/xxx', () => {
+    expect(urlOf('https://host/v1beta', 'models/gemini-3-flash')).toBe(
+      'https://host/v1beta/models/gemini-3-flash:generateContent',
+    )
+  })
+
+  it('base_url 带查询串时，路径插在查询串之前', () => {
+    expect(urlOf('https://proxy.example/v1beta?key=abc')).toBe(
+      'https://proxy.example/v1beta/models/gemini-3-flash:generateContent?key=abc',
+    )
+  })
+
+  it('末尾多余斜杠不影响结果', () => {
+    expect(urlOf('https://host/v1beta/')).toBe('https://host/v1beta/models/gemini-3-flash:generateContent')
   })
 })

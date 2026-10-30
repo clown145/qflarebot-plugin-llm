@@ -282,12 +282,10 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
   }
   if (stream) body['stream'] = true
 
-  const base = target.provider.base_url.replace(/\/+$/, '')
-  const path = stream ? ':streamGenerateContent?alt=sse' : ':generateContent'
-  const url = base.endsWith(':generateContent') || base.endsWith(':streamGenerateContent')
-    ? base
-    : `${endpointUrl(base, path)}${base.includes('?') ? '' : ''}`
-  return { url, init: { method: 'POST', headers, body: JSON.stringify(body) } }
+  return {
+    url: generateContentUrl(target.provider.base_url, target.model.model, stream),
+    init: { method: 'POST', headers, body: JSON.stringify(body) },
+  }
 }
 
 function parseResponse(json: unknown): ParsedResponse {
@@ -485,6 +483,63 @@ async function* parseStream(
       if (reason) yield { type: 'finish', reason }
     }
   }
+}
+
+/**
+ * 拼 Gemini 的 generateContent 地址。
+ *
+ * 官方 REST 形态是 **`{base}/models/{model}:generateContent`**：
+ *
+ * ```
+ * https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent
+ * ```
+ *
+ * 之前这里只拼了 `{base}:generateContent`，**把 `/models/{model}` 整段漏掉**，
+ * 于是拉取模型列表（`/v1beta/models`，拼得对）正常，但一调用就 404——
+ * 那个 URL 根本不存在，服务端当然找不到。
+ *
+ * 要处理三种 base_url 写法：
+ * 1. 常规：`https://host/v1beta` → 补 `/models/{model}:generateContent`
+ * 2. 用户已经把模型写进去：`.../v1beta/models/gemini-3-flash` → 只补方法后缀
+ * 3. 用户把整个端点写进去：`.../models/gemini-3-flash:generateContent` → 原样用
+ *
+ * 模型名要剥掉可能带的 `models/` 前缀（列表接口返回的是 `models/xxx`，
+ * 用户复制粘贴时也会带），否则会拼出 `/models/models/xxx`。
+ */
+function generateContentUrl(baseUrl: string, modelName: string, stream: boolean): string {
+  const method = stream ? ':streamGenerateContent' : ':generateContent'
+  const query = stream ? '?alt=sse' : ''
+  const base = baseUrl.trim().replace(/\/+$/, '')
+
+  // 情况 3：base_url 已经是完整端点。非流式原样用；
+  // 流式要把方法换成 streamGenerateContent 再补 alt=sse——只加查询参数
+  // 等于还在调非流式端点，拿回来的是普通 JSON 而不是 SSE 流。
+  if (base.endsWith(':generateContent') || base.endsWith(':streamGenerateContent')) {
+    if (!stream) return base
+    const switched = base
+      .replace(/:generateContent/, ':streamGenerateContent')
+      .replace(/:streamGenerateContent\?alt=sse/, ':streamGenerateContent')
+    return switched.includes('alt=sse')
+      ? switched
+      : `${switched}${switched.includes('?') ? '&' : '?'}alt=sse`
+  }
+
+  // 模型名去掉 models/ 前缀，避免拼出 /models/models/xxx
+  const model = modelName.trim().replace(/^models\//, '')
+
+  // 情况 2：base_url 里已经写到了 models/{某个模型}，只补方法后缀
+  if (/\/models\/[^/]+$/.test(base)) {
+    return `${base}${method}${query}`
+  }
+
+  // 情况 1：常规形态，注意 base 可能带 ?key= 之类的查询串
+  const split = base.search(/[?#]/)
+  if (split >= 0) {
+    const path = base.slice(0, split).replace(/\/+$/, '')
+    const suffix = base.slice(split)
+    return `${path}/models/${model}${method}${suffix}`
+  }
+  return `${base}/models/${model}${method}${query}`
 }
 
 function buildListModels(provider: ProviderConfig): BuiltRequest {
