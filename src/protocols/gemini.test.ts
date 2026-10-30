@@ -142,7 +142,8 @@ describe('gemini.buildChat', () => {
     expect(body.contents).toEqual([
       { role: 'user', parts: [{ text: '天气' }] },
       { role: 'model', parts: [{ function_call: { name: 'get_weather', args: { city: '北京' }, id: 'c1' } }] },
-      { role: 'user', parts: [{ functionResponse: { name: 'c1', response: { temp: 20 }, id: 'c1' } }] },
+      // name 是**函数名**，不是调用 id（用 id 会让上游对不上结果）
+      { role: 'user', parts: [{ functionResponse: { name: 'get_weather', response: { temp: 20 }, id: 'c1' } }] },
     ])
   })
 
@@ -157,7 +158,7 @@ describe('gemini.buildChat', () => {
     const body = JSON.parse(built.init.body as string)
     expect(body.contents.at(-1)).toEqual({
       role: 'user',
-      parts: [{ functionResponse: { name: 'c1', response: { result: '不是 JSON 的结果' }, id: 'c1' } }],
+      parts: [{ functionResponse: { name: 't', response: { result: '不是 JSON 的结果' }, id: 'c1' } }],
     })
   })
 
@@ -209,7 +210,9 @@ describe('gemini.parseResponse', () => {
     expect(parsed.reasoning).toBe('思考中')
     expect(parsed.toolCalls).toEqual([{ id: 'call_1', name: 'lookup', arguments: '{"q":"x"}' }])
     expect(parsed.usage).toEqual({ input_tokens: 10, output_tokens: 5, total_tokens: 15 })
-    expect(parsed.finishReason).toBe('stop')
+    // 有工具调用时上游照样给 STOP（Gemini 不像 OpenAI 那样返回 tool_calls），
+    // 这里必须改写成 tool_calls，否则调用方会当成「正常结束」
+    expect(parsed.finishReason).toBe('tool_calls')
   })
 
   it('finish_reason 映射：MAX_TOKENS→length', () => {
@@ -482,5 +485,89 @@ describe('gemini 的 generateContent 地址拼接', () => {
 
   it('末尾多余斜杠不影响结果', () => {
     expect(urlOf('https://host/v1beta/')).toBe('https://host/v1beta/models/gemini-3-flash:generateContent')
+  })
+})
+
+/**
+ * Gemini 的 REST 响应是 **camelCase**（functionCall / finishReason / usageMetadata），
+ * 请求体才是 snake_case。官方 SDK 内部做这层映射，手写 REST 客户端必须自己兜。
+ *
+ * 这组测试用**真实端点返回的原始 JSON** 做样本。之前的测试全部用 snake_case 的
+ * `function_call` 构造响应，等于拿「自己以为的格式」去验证自己，掩盖了工具调用
+ * 被静默丢弃的问题（模型能对话、但永远不调用工具，且没有任何报错）。
+ */
+describe('真实端点返回的 camelCase 响应', () => {
+  it('functionCall（camelCase）能被解析成 toolCalls', () => {
+    const parsed = gemini.parseResponse({
+      candidates: [{
+        content: {
+          role: 'model',
+          parts: [{
+            thoughtSignature: 'sig',
+            functionCall: { name: 'get_weather', args: { city: '北京' }, id: 'call_1211059' },
+          }],
+        },
+        finishReason: 'STOP',
+        finishMessage: 'Model generated function call(s).',
+      }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    })
+    expect(parsed.toolCalls).toEqual([
+      { id: 'call_1211059', name: 'get_weather', arguments: JSON.stringify({ city: '北京' }) },
+    ])
+    expect(parsed.usage).toEqual({ input_tokens: 10, output_tokens: 5, total_tokens: 15 })
+    // 上游给 STOP，但有工具调用时必须是 tool_calls
+    expect(parsed.finishReason).toBe('tool_calls')
+  })
+
+  it('流式：camelCase 的 functionCall 也产出 tool_call_delta', async () => {
+    const out = await events([
+      'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":{"q":"x"}}}]},"finishReason":"STOP"}]}\n\n',
+    ])
+    const call = out.find((e) => e.type === 'tool_call_delta')
+    expect(call).toMatchObject({ type: 'tool_call_delta', name: 'lookup', argumentsDelta: '{"q":"x"}' })
+    // snake_case 的兼容网关同样要支持
+    const snake = await events([
+      'data: {"candidates":[{"content":{"parts":[{"function_call":{"name":"lookup","args":{}}}]}}]}\n\n',
+    ])
+    expect(snake.some((e) => e.type === 'tool_call_delta')).toBe(true)
+  })
+})
+
+/**
+ * functionResponse.name 必须是**函数名**，不是调用 id。
+ *
+ * 用 id 填进去，上游会把「某个不存在函数的结果」当成无效输入，表现为模型忽略工具结果、
+ * 或者直接说没法调用工具。契约里的 tool 消息只有 tool_call_id，所以要从历史的
+ * assistant.tool_calls 反查名字。
+ */
+describe('functionResponse 的 name 用函数名', () => {
+  it('从历史 tool_calls 反查出函数名，而不是用调用 id', () => {
+    const built = gemini.buildChat(target, {
+      messages: [
+        { role: 'user', content: '天气' },
+        { role: 'assistant', tool_calls: [{ id: 'call_abc', name: 'get_weather', arguments: '{"city":"北京"}' }] },
+        { role: 'tool', tool_call_id: 'call_abc', content: '{"temp":25}' },
+      ],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    const response = body.contents.at(-1).parts[0].functionResponse
+    expect(response.name).toBe('get_weather')
+    // id 仍然保留，用于和 functionCall 对应
+    expect(response.id).toBe('call_abc')
+  })
+
+  it('反查不到时退回调用 id（不至于拼出空字段）', () => {
+    const built = gemini.buildChat(target, {
+      messages: [
+        { role: 'user', content: 'x' },
+        { role: 'tool', tool_call_id: 'orphan_id', content: 'r' },
+      ],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    // 相邻的同 role content 会合并成一段，所以 functionResponse 是 parts 里的第二项
+    const last = body.contents.at(-1)
+    const response = last.parts.find((p: Record<string, unknown>) => p['functionResponse'])
+    expect(response.functionResponse.name).toBe('orphan_id')
   })
 })

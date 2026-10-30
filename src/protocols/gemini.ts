@@ -117,6 +117,15 @@ function mapMessages(messages: ChatMessage[]): { system: string; contents: Gemin
   const system: string[] = []
   const contents: GeminiContent[] = []
 
+  // 工具调用 id → 函数名。tool 消息只有 id，而 Gemini 的 functionResponse
+  // 要的是函数名；先扫一遍历史建立索引，后面处理 tool 消息时才能填对。
+  const toolCallNames = new Map<string, string>()
+  for (const message of messages) {
+    for (const call of message.tool_calls ?? []) {
+      if (call.id && call.name) toolCallNames.set(call.id, call.name)
+    }
+  }
+
   const push = (role: GeminiContent['role'], parts: GeminiPart[]) => {
     if (!parts.length) return
     const last = contents[contents.length - 1]
@@ -193,7 +202,15 @@ function mapMessages(messages: ChatMessage[]): { system: string; contents: Gemin
     }
     // tool → user 的 functionResponse
     if (!message.tool_call_id) throw new LLMError('bad_request', `${where} 缺少 tool_call_id`)
-    let name = message.tool_call_id
+    // **functionResponse.name 必须是函数名，不是调用 id。**
+    //
+    // Gemini 靠这个字段把结果对回是哪次调用，而调用 id（`call_xxx`）跟函数名是两回事：
+    // 用 id 填进去，上游会认为「返回了一个不存在的函数的结果」，表现为模型接着说
+    // 「我没法调用工具」或者干脆忽略结果。
+    //
+    // 契约里的 tool 消息只带 tool_call_id，所以要从历史里的 assistant.tool_calls 反查。
+    // 反查不到时退回 id（至少不会拼出空字段，上游会给出可读的报错）。
+    const name = toolCallNames.get(message.tool_call_id) ?? message.tool_call_id
     let response: Record<string, unknown> = {}
     if (typeof message.content === 'string' && message.content.trim()) {
       try {
@@ -288,6 +305,30 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
   }
 }
 
+/**
+ * 从一个 part 里取出 functionCall。
+ *
+ * **响应是 camelCase，请求是 snake_case**——这是 Gemini REST 的既定差异，不是笔误：
+ *
+ * ```
+ * 请求: { "function_call": ... }  /  contents[].parts[].functionCall 响应
+ * 响应: { "functionCall": { name, args, id } }
+ * ```
+ *
+ * 官方 SDK 在内部完成这层映射，所以照 SDK 写的代码看不到这个差异；
+ * 手写 REST 调用则必须同时接受两种写法。只认 snake_case 的后果是**静默丢工具调用**：
+ * 上游正常返回，模型却认为「没有可调用的工具」，对话照常进行但永远不触发函数。
+ *
+ * 同文件里 `thoughtSignature`、`finishReason`、`usageMetadata` 早就做了双写兜底，
+ * 唯独这个字段漏了——工具调用走不通就是因为这一处。
+ */
+function asFunctionCall(part: Record<string, unknown>): Record<string, unknown> | undefined {
+  const camel = part['functionCall']
+  if (isRecord(camel)) return camel
+  const snake = part['function_call']
+  return isRecord(snake) ? snake : undefined
+}
+
 function parseResponse(json: unknown): ParsedResponse {
   if (!isRecord(json)) throw new Error('上游返回的不是 JSON 对象')
   if (isRecord(json['error'])) throw streamError(json['error'], { provider: '', alias: '', timeoutMs: 0 })
@@ -322,7 +363,11 @@ function parseResponse(json: unknown): ParsedResponse {
       text += partText
       return
     }
-    const call = isRecord(raw['function_call']) ? raw['function_call'] : undefined
+    // Gemini 的 REST 响应是 **camelCase**（functionCall），而请求体是 snake_case（function_call）。
+    // 官方 Python/JS SDK 内部做这层映射，手写 REST 客户端必须自己兜住——
+    // 只读 snake_case 会让工具调用被静默丢弃：上游明明返回了 functionCall，模型侧却拿到空结果，
+    // 表现为「能对话、但从不调用工具」，而且没有任何报错。
+    const call = asFunctionCall(raw)
     if (call) {
       const name = asString(call['name'])
       if (!name) return
@@ -342,7 +387,15 @@ function parseResponse(json: unknown): ParsedResponse {
       }
     }
   })
-  const finishReason = geminiFinish(candidate['finish_reason'] ?? candidate['finishReason'])
+  // **有工具调用时 finishReason 必须是 tool_calls，即使上游给的是 STOP。**
+  // Gemini 不像 OpenAI/Anthropic 那样返回专门的 tool_calls/tool_use 结束原因：
+  // 它照样返回 `STOP`，只在 `finishMessage` 里写一句「Model generated function call(s).」。
+  // 直接透传会让调用方看到「正常结束 + 有 tool_calls」这种自相矛盾的结果。
+  // service.ts 的 `parsed.finishReason ?? (toolCalls ? 'tool_calls' : ...)` 里的 `??`
+  // 会优先取到 'stop'，工具调用虽然还在，结束时却会走「正常结束」分支。
+  const finishReason = toolCalls.length
+    ? 'tool_calls'
+    : geminiFinish(candidate['finish_reason'] ?? candidate['finishReason'])
   const usage = geminiUsage(json['usage_metadata'] ?? json['usageMetadata'])
   return {
     text,
@@ -448,7 +501,7 @@ async function* parseStream(
           yield { type: thought ? 'reasoning_delta' : 'text_delta', text }
           continue
         }
-        const call = isRecord(partRaw['function_call']) ? partRaw['function_call'] : undefined
+        const call = asFunctionCall(partRaw)
         if (call) {
           const name = asString(call['name'])
           if (name) {
