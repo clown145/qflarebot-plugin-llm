@@ -21,6 +21,7 @@ import { mergeUsage } from './protocols/shared.js'
 import { adapterFor } from './protocols/registry.js'
 import type { BuiltRequest, ParsedResponse, ProtocolAdapter } from './protocols/types.js'
 import { validateChatRequest } from './request.js'
+import { isMetadataHost } from './config/validate.js'
 import { mapHistoryToolNames, mapRequestToolNames, mapResultToolNames, toolNameMapFor, type ToolNameMap } from './toolNames.js'
 import { CONFIG_READ_FAILED, type ConfigStore, type LoadedConfig } from './store.js'
 import { fetchJson, openStream, type TransportOptions } from './transport.js'
@@ -448,6 +449,12 @@ export class LLM implements LLMService {
 
   private build(prepared: Prepared, stream: boolean): BuiltRequest {
     try {
+      // 发出去之前再过一道元数据地址检查。
+      //
+      // 保存时已经校验过（`checkBaseUrl`），这里是纵深防御：配置可能来自导入、
+      // 手工改 KV、或未来某条绕过校验的新路径。元数据地址能拿到实例凭证，
+      // 值得在真正发请求前再拦一次——**即使这个供应商开着 allow_http**。
+      assertNotMetadataHost(prepared.provider.base_url, prepared.provider.id)
       // 发出去的名字必须是 wire 名：tools 列表、tool_choice、以及历史里回填的 tool_calls。
       // 三者都用同一个映射，保证「这一轮发的名字」与「上一轮回填的名字」对得上。
       const wireRequest = mapHistoryToolNames(mapRequestToolNames(prepared.request, prepared.toolNames), prepared.toolNames)
@@ -500,6 +507,27 @@ export class LLM implements LLMService {
       model: prepared.model.model,
       ms: Date.now() - startedAt,
       ...errorFields(err),
+    })
+  }
+}
+
+/**
+ * 发请求前的元数据地址兜底检查（纵深防御）。
+ *
+ * 保存路径的 `checkBaseUrl` 已经拦过，但配置也可能来自导入或手工改 KV。
+ * 这里再判一次，避免任何一条路径把请求送到云元数据服务上——
+ * 那个地址能换到实例凭证，`allow_http` 也不该放行它。
+ */
+function assertNotMetadataHost(baseUrl: string, providerId: string): void {
+  let hostname: string
+  try {
+    hostname = new URL(baseUrl).hostname
+  } catch {
+    return // 地址本身非法会在 buildChat 里报出来，这里不重复处理
+  }
+  if (isMetadataHost(hostname)) {
+    throw new LLMError('bad_request', `供应商 ${providerId} 的接口地址指向云元数据服务，已拒绝`, {
+      provider: providerId,
     })
   }
 }

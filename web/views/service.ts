@@ -936,6 +936,28 @@ function providerCard(): HTMLElement {
   const enabled = h('input', { type: 'checkbox', checked: draft.enabled })
   const enabledLabel = h('label', { class: 'switch switch-label' }, enabled, h('span', { class: 'switch-track' }), h('span', { class: 'switch-text', text: '启用这个供应商' }))
 
+  /**
+   * 允许明文 HTTP / 内网地址。默认关。
+   *
+   * 唯一正当用途：上游只能用 IP 访问（IP 签不出证书，自签证书 Cloudflare 的
+   * fetch 也不认），或上游在内网里。开了之后 API Key 会明文过链路，
+   * 所以文案必须把代价说清楚，不能让人随手勾上。
+   */
+  const allowHttp = h('input', { type: 'checkbox', checked: draft.allow_http === true })
+  const allowHttpLabel = h(
+    'label',
+    { class: 'switch switch-label' },
+    allowHttp,
+    h('span', { class: 'switch-track' }),
+    h('span', { class: 'switch-text', text: '允许明文 HTTP / 内网地址（高级）' }),
+  )
+  const allowHttpHint = h('span', {
+    class: 'desc warn-text',
+    text: '只在接口地址是 HTTP、或者是 IP / 内网主机时需要打开。打开后 API Key 会明文经过链路，别在不可信网络里用。云厂商元数据地址始终拒绝。',
+  })
+  allowHttpHint.style.display = draft.allow_http === true ? '' : 'none'
+  const allowHttpBox = h('div', { class: 'field' }, allowHttpLabel, allowHttpHint)
+
   const refs = { save, dirty: dirtyBadge, keyBadge, clearKey, key, enabledBadge, title }
   const touch = () => {
     syncPending()
@@ -991,6 +1013,12 @@ function providerCard(): HTMLElement {
     touch()
   })
 
+  allowHttp.addEventListener('change', () => {
+    draft.allow_http = allowHttp.checked
+    allowHttpHint.style.display = allowHttp.checked ? '' : 'none'
+    touch()
+  })
+
   test.addEventListener('click', () => {
     if (test.disabled) return
     void testProvider(test)
@@ -1037,6 +1065,7 @@ function providerCard(): HTMLElement {
       field('超时（毫秒）', timeout, `留空用默认值（${limits.defaultMs}）；${timeoutHint(limits)}`),
     ),
     h('div', { class: 'field provider-url' }, h('label', { text: '接口地址' }), baseUrl, baseHint),
+    allowHttpBox,
     h(
       'div',
       { class: 'grid' },

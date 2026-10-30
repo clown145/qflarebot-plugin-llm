@@ -299,3 +299,50 @@ describe('LLM 错误语义', () => {
     expect(result.provider).toBeUndefined()
   })
 })
+
+describe('发请求前的元数据地址兜底（纵深防御）', () => {
+  /** 配置里直接写死一个 http + allow_http 的供应商（模拟绕过校验的写入路径） */
+  function httpConfig(baseUrl: string): StoredConfig {
+    return {
+      schema_version: 1,
+      version: 1,
+      providers: [{
+        id: 'p', name: 'P', protocol: 'openai', base_url: baseUrl,
+        api_key: 'sk-test', enabled: true, allow_http: true,
+      }],
+      models: [{ alias: 'chat', provider: 'p', model: 'gpt-4o-mini', enabled: true }],
+      default_model: 'chat',
+      request_timeout_ms: 15000,
+      max_retries: 0,
+      updated_at: new Date().toISOString(),
+    }
+  }
+
+  it('元数据地址即使开着 allow_http 也发不出去，并且一次 fetch 都不发生', async () => {
+    const calls: string[] = []
+    const fetchImpl = (async (url: string) => {
+      calls.push(String(url))
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    const llm = client(fetchImpl, httpConfig('http://169.254.169.254/v1'))
+    await expect(llm.chat({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/元数据/)
+    expect(calls).toEqual([])
+  })
+
+  it('普通的 http 公网地址在 allow_http 下能正常发出去（确认上一条不是把所有 http 都拦了）', async () => {
+    const calls: string[] = []
+    const fetchImpl = (async (url: string) => {
+      calls.push(String(url))
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+
+    const llm = client(fetchImpl, httpConfig('http://1.2.3.4:8000/v1'))
+    const result = await llm.chat({ messages: [{ role: 'user', content: 'hi' }] })
+    expect(result.text).toBe('ok')
+    expect(calls[0]).toContain('http://1.2.3.4:8000/v1')
+  })
+})

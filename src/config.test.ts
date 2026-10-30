@@ -4,7 +4,7 @@ import { normalizeConfig } from './config/normalize.js'
 import { resolveTarget } from './config/resolve.js'
 import { mergeSecrets, toPublicConfig } from './config/secrets.js'
 import type { StoredConfig } from './config/types.js'
-import { validateConfig, isPrivateHost, checkBaseUrl } from './config/validate.js'
+import { validateConfig, isPrivateHost, checkBaseUrl, isMetadataHost } from './config/validate.js'
 
 function sample(): StoredConfig {
   const config = createDefaultConfig()
@@ -202,5 +202,59 @@ describe('resolveTarget', () => {
       max_output_tokens: 8192,
       capabilities: ['text', 'image', 'reasoning'],
     })
+  })
+})
+
+describe('allow_http：上游只能用 IP 时的口子', () => {
+  const check = (url: string, allowHttp?: boolean) => {
+    const issues: { level: string; path: string; message: string }[] = []
+    checkBaseUrl(url, 'providers.0.base_url', issues as never, allowHttp === undefined ? {} : { allowHttp })
+    return issues
+  }
+
+  it('默认拒绝 http', () => {
+    const issues = check('http://1.2.3.4:8000/v1')
+    expect(issues.some((i) => i.level === 'error' && i.message.includes('https'))).toBe(true)
+  })
+
+  it('打开后允许 http 的公网 IP（这正是本功能的用途）', () => {
+    expect(check('http://1.2.3.4:8000/v1', true)).toEqual([])
+  })
+
+  it('打开后也允许 http 的内网地址（自建推理服务的正当场景）', () => {
+    expect(check('http://192.168.1.10:8000/v1', true)).toEqual([])
+    expect(check('http://localhost:8000/v1', true)).toEqual([])
+  })
+
+  it('不打开时仍然拒绝内网地址', () => {
+    const issues = check('https://192.168.1.10/v1')
+    expect(issues.some((i) => i.level === 'error')).toBe(true)
+  })
+
+  it('即使打开 allow_http，云元数据地址永远拒绝（SSRF 底线）', () => {
+    for (const url of [
+      'http://169.254.169.254/latest/meta-data/',
+      'http://169.254.169.254/v1',
+      'http://[::ffff:169.254.169.254]/v1',
+      'http://[fd00:ec2::254]/v1',
+      'https://169.254.169.254/v1',
+    ]) {
+      const issues = check(url, true)
+      expect(issues.some((i) => i.level === 'error' && i.message.includes('元数据')), url).toBe(true)
+    }
+  })
+
+  it('非 http/https 协议即使打开开关也拒绝（不能是 ftp: file: 之类）', () => {
+    expect(check('ftp://example.com/v1', true).some((i) => i.level === 'error')).toBe(true)
+    expect(check('file:///etc/passwd', true).some((i) => i.level === 'error')).toBe(true)
+  })
+
+  it('isMetadataHost 只认元数据/链路本地段，不误伤普通内网', () => {
+    expect(isMetadataHost('169.254.169.254')).toBe(true)
+    expect(isMetadataHost('169.254.1.1')).toBe(true)
+    expect(isMetadataHost('192.168.1.1')).toBe(false)
+    expect(isMetadataHost('10.0.0.5')).toBe(false)
+    expect(isMetadataHost('[fd00:ec2::254]')).toBe(true)
+    expect(isMetadataHost('[fd00::1]')).toBe(false)
   })
 })

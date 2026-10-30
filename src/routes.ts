@@ -249,10 +249,11 @@ export function createRoutes(): Route[] {
         const provider = normalizeProvider(raw, 0)
         if (!provider.id) throw new HttpError(400, 'provider.id 必填')
         if (!provider.base_url) throw new HttpError(400, 'provider.base_url 必填')
-        // 与保存路径同一道防线：拒绝 http / 回环 / 内网，避免把密钥发进内网或明文外发
+        // 与保存路径同一道防线：拒绝 http / 回环 / 内网，避免把密钥发进内网或明文外发。
+        // allow_http 由这个供应商自己的配置决定（用户显式打开才能走明文）
         {
           const issues: ConfigIssue[] = []
-          checkBaseUrl(provider.base_url, 'provider.base_url', issues)
+          checkBaseUrl(provider.base_url, 'provider.base_url', issues, { allowHttp: provider.allow_http === true })
           if (hasErrors(issues)) throw new HttpError(400, issues[0]!.message)
         }
 

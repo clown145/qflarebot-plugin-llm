@@ -68,3 +68,18 @@ describe('providerFingerprint', () => {
     expect(isProviderDraftDirty(draft, draft, false)).toBe(false)
   })
 })
+
+describe('allow_http 参与脏检查', () => {
+  it('只是切换 allow_http 也算未保存修改', () => {
+    const base = provider({ allow_http: false })
+    const draft = provider({ allow_http: true })
+    expect(isProviderDraftDirty(draft, base, false)).toBe(true)
+    // 指纹本身要能区分
+    expect(providerFingerprint(draft)).not.toBe(providerFingerprint(base))
+  })
+
+  it('都没打开时不算脏（老配置没有这个字段）', () => {
+    expect(isProviderDraftDirty(provider(), provider(), false)).toBe(false)
+    expect(providerFingerprint(provider())).toBe(providerFingerprint(provider({ allow_http: false })))
+  })
+})

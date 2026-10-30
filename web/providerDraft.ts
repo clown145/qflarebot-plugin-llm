@@ -129,6 +129,7 @@ export function providerFingerprint(provider: ProviderDraft): string {
     headers,
     api_key: provider.api_key?.trim() || null,
     clear_key: Boolean(provider.clear_key),
+    allow_http: provider.allow_http === true,
   })
 }
 

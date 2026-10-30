@@ -15,6 +15,16 @@ export interface ProviderConfig {
   headers?: Record<string, string>
   timeout_ms?: number
   enabled: boolean
+  /**
+   * 允许明文 HTTP 与内网地址（默认关）。
+   *
+   * 只给一种场景开：**上游只能用 IP 访问**。IP 签不出证书，自签证书 Cloudflare
+   * 的 fetch 也不认，所以只能走 http；内网部署同理。
+   *
+   * 打开后 API Key 会明文过链路，也会被发到内网地址——这正是默认关的原因。
+   * 页面上必须有明确提示，不能让人不知不觉选上。
+   */
+  allow_http?: boolean
 }
 
 export interface ModelConfig {

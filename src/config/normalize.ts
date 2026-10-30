@@ -48,6 +48,8 @@ export function normalizeProvider(raw: unknown, index: number): ProviderConfig {
     ...(headers ? { headers } : {}),
     ...(timeout !== undefined ? { timeout_ms: timeout } : {}),
     enabled: typeof item['enabled'] === 'boolean' ? item['enabled'] : true,
+    // 只在明确为 true 时落盘：老配置没有这个字段，读出来就是「默认关」
+    ...(item['allow_http'] === true ? { allow_http: true } : {}),
   }
 }
 

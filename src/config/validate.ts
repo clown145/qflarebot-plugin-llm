@@ -107,6 +107,46 @@ export function isPrivateHost(hostname: string): boolean {
   const host = hostname.replace(/\.$/, '').toLowerCase() // 尾点 FQDN（localhost.）
   return host === 'localhost'
 }
+/**
+ * 云厂商元数据地址。**即使打开 `allow_http` 也必须拒绝**。
+ *
+ * 这是 SSRF 最经典的攻击目标：能请求到它就等于拿到实例的临时凭证。
+ * 两边都要堵——IPv4 链路本地段与 IPv6 的链路本地/未指定段。
+ *
+ * 覆盖：
+ * - `169.254.169.254`（AWS / GCP / Azure / 阿里云 / 腾讯云都用这个）
+ * - `169.254.0.0/16` 整段链路本地（同段内还有别的服务）
+ * - `[::ffff:169.254.169.254]` 之类的 IPv4 映射
+ * - `fd00:ec2::254`（AWS 的 IPv6 元数据地址）
+ * - `[fe80::...]` 链路本地
+ */
+export function isMetadataHost(hostname: string): boolean {
+  if (hostname.startsWith('[')) {
+    if (!hostname.endsWith(']')) return true
+    const groups = ipv6Groups(hostname.slice(1, -1))
+    if (!groups || groups.length !== 8) return true
+    // IPv4 映射：::ffff:a.b.c.d
+    if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
+      const v4 = ((groups[6]! << 16) | groups[7]!) >>> 0
+      return ipv4Metadata(v4)
+    }
+    // AWS IPv6 元数据地址 fd00:ec2::254
+    const awsV6 =
+      groups[0] === 0xfd00 && groups[1] === 0x0ec2 && groups.slice(2, 7).every((g) => g === 0) && groups[7] === 0x254
+    // 链路本地 fe80::/10（元数据服务有时也绑在这）
+    const linkLocal = (groups[0]! & 0xffc0) === 0xfe80
+    return awsV6 || linkLocal
+  }
+  const v4 = ipv4Value(hostname)
+  return v4 !== undefined && ipv4Metadata(v4)
+}
+
+/** IPv4 数值是否落在链路本地/元数据段 */
+function ipv4Metadata(value: number): boolean {
+  // 169.254.0.0/16：链路本地，云元数据都在这一段的 169.254.169.254
+  return value >= 0xa9fe0000 && value <= 0xa9feffff
+}
+
 const MAX_CONTEXT_WINDOW = 10_000_000
 const MAX_OUTPUT_TOKENS = 1_000_000
 
@@ -125,8 +165,26 @@ function checkTimeout(value: number, path: string, issues: ConfigIssue[]): void 
   }
 }
 
-/** 校验上游接口地址：必须 https，且不能是回环/内网主机。供保存路径与 /api/upstream-models、/api/test 复用 */
-export function checkBaseUrl(value: string, path: string, issues: ConfigIssue[]): void {
+/**
+ * 校验上游接口地址。供保存路径与 /api/upstream-models、/api/test 复用。
+ *
+ * ## 默认拒绝 http 与内网地址
+ *
+ * 两道防线都为了同一件事：**别把 API Key 送去不该去的地方**。
+ * http 会明文暴露 Key；内网地址可能是别人架在云上的 SSRF 跳板。
+ *
+ * ## `allowHttp` 是给「上游只能用 IP」开的口子
+ *
+ * IP 签不出证书、自签证书 Cloudflare 的 fetch 也不认，所以那种部署只能走 http。
+ * 但即使打开，**云元数据地址永远拒绝**——那是 SSRF 最经典的攻击目标
+ * （拿到实例的临时凭证就完事了），没有任何正当理由去请求它。
+ */
+export function checkBaseUrl(
+  value: string,
+  path: string,
+  issues: ConfigIssue[],
+  options: { allowHttp?: boolean } = {},
+): void {
   if (!value) {
     issues.push(issue('error', path, '必填'))
     return
@@ -143,15 +201,27 @@ export function checkBaseUrl(value: string, path: string, issues: ConfigIssue[])
     return
   }
   if (url.protocol !== 'https:') {
-    // API Key 走 Authorization 头，明文 HTTP 会在链路上暴露
-    issues.push(issue('error', path, '只支持 https 地址；用 http 会把 API Key 明文发出去'))
+    if (url.protocol !== 'http:') {
+      issues.push(issue('error', path, '只支持 http / https 地址'))
+      return
+    }
+    if (!options.allowHttp) {
+      // API Key 走 Authorization 头，明文 HTTP 会在链路上暴露
+      issues.push(issue('error', path, '只支持 https 地址；用 http 会把 API Key 明文发出去。确实只能走 http（例如上游是个 IP，签不了证书）时，在下面打开「允许明文 HTTP」'))
+      return
+    }
+  }
+  // 元数据地址无论如何都拦：开了 allow_http 也不放行
+  if (isMetadataHost(url.hostname)) {
+    issues.push(issue('error', path, '不能是云厂商的元数据地址'))
     return
   }
   if (url.username || url.password) {
     issues.push(issue('error', path, '不要在接口地址里写用户名/密码；密钥请放到 API Key 字段'))
   }
-  if (PRIVATE_HOST.test(url.hostname) || isPrivateHost(url.hostname)) {
-    issues.push(issue('error', path, '不能是回环或内网地址；API Key 会被发到内网服务'))
+  // 内网 / 回环：开了 allow_http 就放行（内网部署的正当场景），但上面已经有元数据兜底
+  if (!options.allowHttp && (PRIVATE_HOST.test(url.hostname) || isPrivateHost(url.hostname))) {
+    issues.push(issue('error', path, '不能是回环或内网地址；API Key 会被发到内网服务。确实要连内网（例如自建在局域网里的推理服务）时，在下面打开「允许明文 HTTP」'))
   }
 }
 
@@ -184,7 +254,7 @@ export function validateConfig(config: StoredConfig): ConfigIssue[] {
     if (provider.protocol !== 'openai' && provider.protocol !== 'anthropic' && provider.protocol !== 'gemini') {
       issues.push(issue('error', `${base}.protocol`, '不支持的协议'))
     }
-    checkBaseUrl(provider.base_url, `${base}.base_url`, issues)
+    checkBaseUrl(provider.base_url, `${base}.base_url`, issues, { allowHttp: provider.allow_http === true })
 
     if (provider.timeout_ms !== undefined) checkTimeout(provider.timeout_ms, `${base}.timeout_ms`, issues)
     if (!provider.api_key) issues.push(issue('warn', `${base}.api_key`, '未设置 API Key；上游要求认证时会调用失败'))
