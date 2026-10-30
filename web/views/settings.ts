@@ -133,8 +133,8 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
   })
 
   const dirtyBadge = badge('未保存', 'warn')
-  const save = h('button', { class: 'btn primary', text: '保存设置', type: 'button' })
-  const reset = h('button', { class: 'btn ghost', text: '放弃修改', type: 'button' })
+  const save = h('button', { class: 'qb-btn qb-btn--primary', text: '保存设置', type: 'button' })
+  const reset = h('button', { class: 'qb-btn qb-btn--ghost', text: '放弃修改', type: 'button' })
 
   const updateLocal = () => {
     const changed = dirty()
@@ -202,7 +202,7 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
 
   const card = h(
     'div',
-    { class: 'card' },
+    { class: 'qb-card' },
     h(
       'div',
       { class: 'card-head' },
@@ -252,7 +252,7 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
   container.append(
     h(
       'div',
-      { class: 'card' },
+      { class: 'qb-card' },
       h('div', { class: 'card-head' }, h('div', {}, h('h2', { text: '服务信息' }), h('p', { class: 'hint', text: '其他插件通过 ctx.service("llm") 取这个服务。' }))),
       h(
         'div',

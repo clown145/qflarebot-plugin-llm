@@ -10,7 +10,7 @@ export interface DialogShell {
 export function dialogShell(title: string, onClose?: () => void, className = ''): DialogShell {
   const body = h('div')
   const actions = h('div', { class: 'dialog-actions' })
-  const close = h('button', { class: 'btn ghost small', text: '关闭', type: 'button' })
+  const close = h('button', { class: 'qb-btn qb-btn--ghost qb-btn--sm', text: '关闭', type: 'button' })
   const dialog = h(
     'dialog',
     { class: className },
@@ -52,7 +52,7 @@ export function showTestResult(result: PingResult): void {
   )
   if (result.text) view.body.append(h('h3', { text: '返回内容', style: 'margin-top:16px' }), h('pre', { text: result.text }))
   if (result.error) view.body.append(h('div', { class: 'issue error', text: result.error, style: 'margin-top:12px' }))
-  view.actions.append(h('button', { class: 'btn primary', text: '知道了', type: 'button', on: { click: () => view.dialog.close() } }))
+  view.actions.append(h('button', { class: 'qb-btn qb-btn--primary', text: '知道了', type: 'button', on: { click: () => view.dialog.close() } }))
 }
 
 function usageText(result: PingResult): string {
@@ -80,8 +80,8 @@ export function confirmDialog(message: string, confirmText = '确定'): Promise<
     view = dialogShell('确认', () => finish(false))
     view.body.append(h('p', { text: message }))
     view.actions.append(
-      h('button', { class: 'btn', text: '取消', type: 'button', on: { click: () => finish(false) } }),
-      h('button', { class: 'btn danger', text: confirmText, type: 'button', on: { click: () => finish(true) } }),
+      h('button', { class: 'qb-btn', text: '取消', type: 'button', on: { click: () => finish(false) } }),
+      h('button', { class: 'qb-btn qb-btn--danger', text: confirmText, type: 'button', on: { click: () => finish(true) } }),
     )
   })
 }

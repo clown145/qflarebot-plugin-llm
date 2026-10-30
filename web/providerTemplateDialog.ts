@@ -53,7 +53,7 @@ export function pickProviderPreset(): Promise<ProviderPreset | null> {
     )
     view.actions.append(
       h('div', { style: 'flex:1' }),
-      h('button', { class: 'btn', text: '取消', type: 'button', on: { click: () => finish(null) } }),
+      h('button', { class: 'qb-btn', text: '取消', type: 'button', on: { click: () => finish(null) } }),
     )
     search.focus()
   })

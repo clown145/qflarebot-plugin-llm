@@ -46,11 +46,11 @@ function updateHeader(): void {
 }
 
 function header(): HTMLElement {
-  const refresh = h('button', { class: 'btn ghost', text: '刷新', type: 'button', attrs: { id: 'refresh-btn' } })
+  const refresh = h('button', { class: 'qb-btn qb-btn--ghost', text: '刷新', type: 'button', attrs: { id: 'refresh-btn' } })
   refresh.addEventListener('click', () => void reload())
-  const importButton = h('button', { class: 'btn', text: '导入', type: 'button', attrs: { id: 'import-btn' } })
+  const importButton = h('button', { class: 'qb-btn', text: '导入', type: 'button', attrs: { id: 'import-btn' } })
   importButton.addEventListener('click', () => void importConfig())
-  const exportButton = h('button', { class: 'btn', text: '导出', type: 'button', attrs: { id: 'export-btn' } })
+  const exportButton = h('button', { class: 'qb-btn', text: '导出', type: 'button', attrs: { id: 'export-btn' } })
   exportButton.addEventListener('click', () => exportConfig())
 
   return h(
@@ -94,7 +94,7 @@ function tabs(): HTMLElement {
 function issuesBanner(): HTMLElement | null {
   const errors = state.issues.filter((item) => item.level === 'error')
   if (errors.length === 0) return null
-  const card = h('div', { class: 'card', style: 'border-color:var(--qb-danger)' })
+  const card = h('div', { class: 'qb-card', style: 'border-color:var(--qb-danger)' })
   card.append(h('h3', { text: `有 ${errors.length} 个配置错误，保存会被拦下` }))
   for (const item of errors.slice(0, 3)) {
     card.append(
@@ -106,7 +106,7 @@ function issuesBanner(): HTMLElement | null {
       ),
     )
   }
-  card.append(h('button', { class: 'btn small', text: '去概览看全部', type: 'button', on: { click: () => goTab('overview') } }))
+  card.append(h('button', { class: 'qb-btn qb-btn--sm', text: '去概览看全部', type: 'button', on: { click: () => goTab('overview') } }))
   return card
 }
 
@@ -158,7 +158,7 @@ async function load(): Promise<void> {
           { class: 'fatal' },
           h('h2', { text: '加载失败' }),
           h('p', { class: 'muted', text: err instanceof Error ? err.message : String(err), style: 'margin-top:8px' }),
-          h('button', { class: 'btn', text: '重试', type: 'button', on: { click: () => void load() } }),
+          h('button', { class: 'qb-btn', text: '重试', type: 'button', on: { click: () => void load() } }),
         ),
       )
     }

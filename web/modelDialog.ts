@@ -153,7 +153,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
 
   function sourceControls(catalog: ModelCatalog, resolution: MetadataResolution, modelId: string): void {
     metaActions.replaceChildren()
-    const retry = h('button', { class: 'btn ghost small', text: '重新获取', type: 'button' })
+    const retry = h('button', { class: 'qb-btn qb-btn--ghost qb-btn--sm', text: '重新获取', type: 'button' })
     retry.addEventListener('click', () => {
       window.clearTimeout(lookupTimer)
       lookupSeq += 1
@@ -165,7 +165,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
     const source = h('select')
     source.append(h('option', { value: '', text: '选择来源' }))
     for (const item of resolution.sources) source.append(h('option', { value: item, text: item }))
-    const apply = h('button', { class: 'btn small', text: '按来源填充', type: 'button' })
+    const apply = h('button', { class: 'qb-btn qb-btn--sm', text: '按来源填充', type: 'button' })
     apply.addEventListener('click', () => {
       if (!source.value) {
         void toast('先选择一个来源', 'warning')
@@ -286,8 +286,8 @@ export function openModelDialog(options: ModelDialogOptions): void {
    */
   let saving = false
 
-  const closeButton = h('button', { class: 'btn ghost small', text: '关闭', type: 'button' })
-  const cancelButton = h('button', { class: 'btn', text: '取消', type: 'button' })
+  const closeButton = h('button', { class: 'qb-btn qb-btn--ghost qb-btn--sm', text: '关闭', type: 'button' })
+  const cancelButton = h('button', { class: 'qb-btn', text: '取消', type: 'button' })
   const setSaving = (next: boolean): void => {
     saving = next
     closeButton.disabled = next
@@ -347,7 +347,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
       h('div', { style: 'flex:1' }),
       cancelButton,
       (() => {
-        const save = h('button', { class: 'btn primary', text: '保存并应用', type: 'button' })
+        const save = h('button', { class: 'qb-btn qb-btn--primary', text: '保存并应用', type: 'button' })
         save.addEventListener('click', async () => {
           if (saving) return
           let nextAlias = alias.value.trim()

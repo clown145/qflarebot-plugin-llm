@@ -755,12 +755,12 @@ function sidebar(): HTMLElement {
   })
   refreshList()
 
-  const add = h('button', { class: 'btn small', text: '添加', type: 'button' })
+  const add = h('button', { class: 'qb-btn qb-btn--sm', text: '添加', type: 'button' })
   add.addEventListener('click', () => void addProvider())
 
   return h(
     'aside',
-    { class: 'card side-card' },
+    { class: 'qb-card side-card' },
     h('div', { class: 'side-head' }, h('div', {}, h('h3', { text: '供应商' }), h('span', { class: 'small subtle', text: `${count} 个` })), add),
     count || service.isNew ? search : null,
     listBox,
@@ -817,8 +817,8 @@ function providerCard(): HTMLElement {
   const keyBadge = badge('', '')
   const subtitle = h('p', { class: 'hint', text: `${draft.id} · ${protocolLabel(draft.protocol)}` })
 
-  const test = h('button', { class: 'btn', text: '测试', type: 'button' })
-  const save = h('button', { class: 'btn primary', text: service.isNew ? '添加供应商' : '保存', type: 'button' })
+  const test = h('button', { class: 'qb-btn', text: '测试', type: 'button' })
+  const save = h('button', { class: 'qb-btn qb-btn--primary', text: service.isNew ? '添加供应商' : '保存', type: 'button' })
   save.disabled = !draftDirty()
 
   const name = h('input', { value: draft.name, placeholder: '显示名称', attrs: { maxlength: '60' } })
@@ -844,7 +844,7 @@ function providerCard(): HTMLElement {
     placeholder: draft.api_key_set && !draft.clear_key ? '已设置，留空保持不变' : '未设置',
     attrs: { autocomplete: 'new-password' },
   })
-  const clearKey = h('button', { class: 'btn small', text: draft.clear_key ? '撤销清除' : '清除', type: 'button' })
+  const clearKey = h('button', { class: 'qb-btn qb-btn--sm', text: draft.clear_key ? '撤销清除' : '清除', type: 'button' })
   clearKey.disabled = !draft.api_key_set && !draft.api_key && !draft.clear_key
   const headers = h('textarea', { rows: 3, value: formatHeaders(draft.headers), placeholder: 'X-Title: QFlareBot\nHTTP-Referer: https://example.com' })
   const headersHint = h('span', { class: 'desc', text: '每行 Key: Value。只放非密钥头；Authorization / x-api-key 由 API Key 自动生成。' })
@@ -958,7 +958,7 @@ function providerCard(): HTMLElement {
     })
   })
 
-  const remove = h('button', { class: 'btn small danger', text: service.isNew ? '取消新建' : '删除供应商', type: 'button' })
+  const remove = h('button', { class: 'qb-btn qb-btn--danger qb-btn--sm', text: service.isNew ? '取消新建' : '删除供应商', type: 'button' })
   remove.addEventListener('click', () => void removeProvider())
 
   updateLocal(draft, refs)
@@ -966,7 +966,7 @@ function providerCard(): HTMLElement {
 
   return h(
     'div',
-    { class: 'card provider-detail' },
+    { class: 'qb-card provider-detail' },
     h(
       'div',
       { class: 'provider-head' },
@@ -1013,11 +1013,11 @@ function modelRow(model: ModelConfig): HTMLElement {
   const config = state.config
   const isDefault = config?.default_model === model.alias
   const toggle = switchInput(model.enabled, (next) => void toggleModel(model, next))
-  const test = h('button', { class: 'btn small', text: '测试', type: 'button' })
+  const test = h('button', { class: 'qb-btn qb-btn--sm', text: '测试', type: 'button' })
   test.addEventListener('click', () => void testModel(model, test))
-  const edit = h('button', { class: 'btn small', text: '编辑', type: 'button' })
+  const edit = h('button', { class: 'qb-btn qb-btn--sm', text: '编辑', type: 'button' })
   edit.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => rerenderView() }))
-  const remove = h('button', { class: 'btn small danger', text: '删除', type: 'button' })
+  const remove = h('button', { class: 'qb-btn qb-btn--danger qb-btn--sm', text: '删除', type: 'button' })
   remove.addEventListener('click', () => void deleteModel(model))
 
   // AstrBot 同款交互：行主体可点进入编辑（右侧操作区的按钮各自 stopPropagation 语义靠 DOM 层级天然隔离）
@@ -1065,7 +1065,7 @@ function availableSection(): HTMLElement | null {
   const candidates = matches.filter((name) => !configured.has(name))
   const shown = candidates.slice(0, AVAILABLE_LIMIT)
 
-  const all = h('button', { class: 'btn small', text: '全部添加', type: 'button' })
+  const all = h('button', { class: 'qb-btn qb-btn--sm', text: '全部添加', type: 'button' })
   all.disabled = candidates.length === 0 || service.adding || service.fetching
   all.addEventListener('click', () => void addAllAvailable())
 
@@ -1130,10 +1130,10 @@ function modelsPanel(): HTMLElement {
 
   // AstrBot 同款语义：供应商设置有未保存修改时，按钮明示「保存并拉取」，把隐式保存摆到台面上
   const dirty = service.isNew || draftDirty()
-  const refresh = h('button', { class: 'btn small', text: service.fetching ? '拉取中…' : dirty ? '保存并拉取' : '刷新上游', type: 'button' })
+  const refresh = h('button', { class: 'qb-btn qb-btn--sm', text: service.fetching ? '拉取中…' : dirty ? '保存并拉取' : '刷新上游', type: 'button' })
   refresh.disabled = service.fetching || service.adding
   refresh.addEventListener('click', () => void fetchUpstreamModels())
-  const add = h('button', { class: 'btn primary small', text: '添加模型', type: 'button' })
+  const add = h('button', { class: 'qb-btn qb-btn--primary qb-btn--sm', text: '添加模型', type: 'button' })
   add.disabled = service.adding
   add.addEventListener('click', () => void openAddModel())
 
@@ -1173,7 +1173,7 @@ function modelsPanel(): HTMLElement {
 
   return h(
     'div',
-    { class: 'card model-panel' },
+    { class: 'qb-card model-panel' },
     h(
       'div',
       { class: 'card-head' },
@@ -1192,11 +1192,11 @@ function modelsPanel(): HTMLElement {
 }
 
 function emptyWorkbench(): HTMLElement {
-  const add = h('button', { class: 'btn primary', text: '从模板添加供应商', type: 'button' })
+  const add = h('button', { class: 'qb-btn qb-btn--primary', text: '从模板添加供应商', type: 'button' })
   add.addEventListener('click', () => void addProvider())
   return h(
     'div',
-    { class: 'card empty-workbench' },
+    { class: 'qb-card empty-workbench' },
     h('h2', { text: '先添加一个供应商' }),
     h('p', { class: 'muted', text: '选一个服务商模板，填上 API Key，保存后就能拉取模型并添加别名。' }),
     h('div', { class: 'actions' }, add),
@@ -1206,7 +1206,7 @@ function emptyWorkbench(): HTMLElement {
 function renderAliases(container: HTMLElement): void {
   const config = state.config
   if (!config) return
-  const add = h('button', { class: 'btn primary', text: '添加模型', type: 'button' })
+  const add = h('button', { class: 'qb-btn qb-btn--primary', text: '添加模型', type: 'button' })
   add.addEventListener('click', () => {
     if (!config.providers.length) {
       void toast('先到「按供应商」里添加供应商', 'warning')
@@ -1242,13 +1242,13 @@ function renderAliases(container: HTMLElement): void {
       const provider = config.providers.find((item) => item.id === model.provider)
       const isDefault = config.default_model === model.alias
       const toggle = switchInput(model.enabled, (next) => void toggleModel(model, next))
-      const test = h('button', { class: 'btn small', text: '测试', type: 'button' })
+      const test = h('button', { class: 'qb-btn qb-btn--sm', text: '测试', type: 'button' })
       test.addEventListener('click', () => void testModel(model, test))
-      const edit = h('button', { class: 'btn small', text: '编辑', type: 'button' })
+      const edit = h('button', { class: 'qb-btn qb-btn--sm', text: '编辑', type: 'button' })
       edit.addEventListener('click', () => openModelDialog({ model, providerId: model.provider, onSaved: () => rerenderView() }))
-      const remove = h('button', { class: 'btn small danger', text: '删除', type: 'button' })
+      const remove = h('button', { class: 'qb-btn qb-btn--danger qb-btn--sm', text: '删除', type: 'button' })
       remove.addEventListener('click', () => void deleteModel(model))
-      const makeDefault = h('button', { class: 'btn ghost small', text: '设为默认', type: 'button' })
+      const makeDefault = h('button', { class: 'qb-btn qb-btn--ghost qb-btn--sm', text: '设为默认', type: 'button' })
       makeDefault.addEventListener('click', () => void setDefault(model.alias))
 
       tbody.append(
@@ -1298,7 +1298,7 @@ function renderAliases(container: HTMLElement): void {
   container.append(
     h(
       'div',
-      { class: 'card' },
+      { class: 'qb-card' },
       h(
         'div',
         { class: 'card-head' },

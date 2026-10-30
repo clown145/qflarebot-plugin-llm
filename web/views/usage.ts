@@ -2,7 +2,7 @@ import { toast } from '../api.js'
 import { copyText, h } from '../dom.js'
 
 function codeBlock(title: string, code: string): HTMLElement {
-  const button = h('button', { class: 'btn small', text: '复制', type: 'button' })
+  const button = h('button', { class: 'qb-btn qb-btn--sm', text: '复制', type: 'button' })
   button.addEventListener('click', async () => {
     const ok = await copyText(code)
     await toast(ok ? '已复制' : '复制失败，请手动选择', ok ? 'success' : 'warning')
@@ -19,7 +19,7 @@ export function renderUsage(container: HTMLElement): void {
   container.append(
     h(
       'div',
-      { class: 'card' },
+      { class: 'qb-card' },
       h('div', { class: 'card-head' }, h('div', {}, h('h2', { text: '给插件作者的用法' }), h('p', { class: 'hint', text: '这个插件只提供 llm 服务；聊天、上下文、工具执行都在你自己的插件里。' }))),
       codeBlock(
         '1. 声明依赖',
@@ -79,7 +79,7 @@ if (res.tool_calls?.length) {
   container.append(
     h(
       'div',
-      { class: 'card' },
+      { class: 'qb-card' },
       h('h2', { text: '能力与限制' }),
       h(
         'ul',

@@ -34,7 +34,7 @@ export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void
   container.append(
     h(
       'div',
-      { class: 'card' },
+      { class: 'qb-card' },
       h('div', { class: 'card-head' }, h('div', {}, h('h2', { text: '概览' }), h('p', { class: 'hint', text: '配置保存在插件自己的 KV 里；保存后其他插件下一次调用就会读到。' }))),
       h(
         'div',
@@ -51,7 +51,7 @@ export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void
   const issues = state.issues
   const issuesCard = h(
     'div',
-    { class: 'card' },
+    { class: 'qb-card' },
     h('div', { class: 'card-head' }, h('div', {}, h('h2', { text: '配置问题' }), h('p', { class: 'hint', text: '错误会阻止保存；警告不影响保存，但可能导致调用失败。' }))),
   )
   if (issues.length === 0) {
@@ -74,7 +74,7 @@ export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void
   container.append(issuesCard)
 
   const select = testOptions()
-  const button = h('button', { class: 'btn primary', text: '测试', type: 'button' })
+  const button = h('button', { class: 'qb-btn qb-btn--primary', text: '测试', type: 'button' })
   button.addEventListener('click', async () => {
     if (!state.config) return
     const value = select.value
@@ -99,7 +99,7 @@ export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void
   container.append(
     h(
       'div',
-      { class: 'card' },
+      { class: 'qb-card' },
       h('div', { class: 'card-head' }, h('div', {}, h('h2', { text: '快速测试' }), h('p', { class: 'hint', text: '会产生一次极小的真实调用；用的是页面当前内容，不需要先保存。' }))),
       h('div', { class: 'grid' }, h('div', { class: 'field' }, h('label', { text: '测试目标' }), select), h('div', { class: 'field' }, h('label', { text: ' ' }), h('div', {}, button))),
     ),
@@ -107,12 +107,12 @@ export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void
 
   const usageCard = h(
     'div',
-    { class: 'card' },
+    { class: 'qb-card' },
     h('div', { class: 'card-head' }, h('div', {}, h('h2', { text: '给其他插件用' }), h('p', { class: 'hint', text: '调用方在 depends 里声明 llm，然后 ctx.service("llm")。' }))),
   )
   usageCard.append(
     h('p', { class: 'small muted', text: '模型别名是唯一入口：换供应商、换模型只需要改这里。工具定义会透传，执行由调用方负责。' }),
-    h('button', { class: 'btn', text: '查看用法与示例', type: 'button', on: { click: () => goTab('usage') } }),
+    h('button', { class: 'qb-btn', text: '查看用法与示例', type: 'button', on: { click: () => goTab('usage') } }),
   )
   container.append(usageCard)
 }
