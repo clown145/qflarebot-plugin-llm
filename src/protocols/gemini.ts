@@ -180,8 +180,7 @@ function mapMessages(messages: ChatMessage[]): { system: string; contents: Gemin
           continue
         }
         // 文本 part：按下标贴；下标越界时退回最后一个文本 part（上游把签名放在承载该轮思考的 part 上）
-        const index = item.part_index - (textParts.length ? 0 : 0)
-        const target = textParts[index] ?? textParts[textParts.length - 1]
+        const target = textParts[item.part_index] ?? textParts[textParts.length - 1]
         if (target) target.thoughtSignature = item.signature
       }
 
@@ -272,7 +271,9 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
   const maxTokens = request.max_tokens ?? target.model.max_output_tokens ?? DEFAULT_MAX_TOKENS
   const body: Record<string, unknown> = {
     ...(request.extra_body ?? {}),
-    model: target.model.model,
+    // 不写 `model`：模型名已经在 URL 路径里（`/models/{model}:generateContent`），
+    // 请求体没有这个字段。官方端点对多余字段是「能忽略就忽略」，但流式端点对
+    // 未知字段直接 400（见上面对 `stream` 的说明），所以不给自己留隐患。
     contents: mapped.contents,
     generationConfig: {
       maxOutputTokens: maxTokens,
@@ -297,7 +298,10 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
     const config = toolConfig(request.tool_choice)
     if (config) body['tool_config'] = config
   }
-  if (stream) body['stream'] = true
+  // **不要往 body 里塞 `stream`**：流式由 URL 上的 `:streamGenerateContent` 决定，
+  // body 里多一个 `stream` 字段会被官方端点当成未知字段直接 400：
+  //   Invalid JSON payload received. Unknown name "stream" at 'request'
+  // 宽松的兼容网关会忽略它，所以本地测不出来——只有直连 generativelanguage 才炸。
 
   return {
     url: generateContentUrl(target.provider.base_url, target.model.model, stream),
@@ -437,8 +441,15 @@ function geminiUsage(raw: unknown): Usage | undefined {
   const input = asNumber(raw['prompt_token_count'] ?? raw['promptTokenCount'])
   const output = asNumber(raw['candidates_token_count'] ?? raw['candidatesTokenCount'])
   const total = asNumber(raw['total_token_count'] ?? raw['totalTokenCount'])
+  // **思考 token 并入 output_tokens**（Gemini 2.5/3.x 的 thinking 消耗）。
+  //
+  // Gemini 的 `candidatesTokenCount` 不含思考 token，而 `totalTokenCount` 含；
+  // 直接透出会让「input + output ≠ total」，成本核算少算一截，也看不出差在哪。
+  // OpenAI 的 `completion_tokens` 本来就是含推理 token 的，所以并进 output
+  // 是跨协议一致的口径，不需要为此扩展契约（Usage 没有 reasoning_tokens 字段）。
+  const thoughts = asNumber(raw['thoughts_token_count'] ?? raw['thoughtsTokenCount']) ?? 0
   if (input !== undefined) usage.input_tokens = input
-  if (output !== undefined) usage.output_tokens = output
+  if (output !== undefined) usage.output_tokens = output + thoughts
   if (total !== undefined) usage.total_tokens = total
   return Object.keys(usage).length ? usage : undefined
 }
@@ -533,7 +544,9 @@ async function* parseStream(
         }
       }
       const reason = geminiFinish(raw['finish_reason'] ?? raw['finishReason'])
-      if (reason) yield { type: 'finish', reason }
+      // 与非流式同一规则：Gemini 在有工具调用时照样返回 STOP，只在 finishMessage 里提一句。
+      // 这里必须改写成 tool_calls，否则调用方会当成「正常结束」而不再继续跑工具。
+      if (reason) yield { type: 'finish', reason: toolIndex > 0 ? 'tool_calls' : reason }
     }
   }
 }

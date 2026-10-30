@@ -240,7 +240,8 @@ describe('gemini.parseStream', () => {
     expect(out).toContainEqual({ type: 'text_delta', text: '你好' })
     const tool = out.find((item) => item.type === 'tool_call_delta')
     expect(tool).toMatchObject({ index: 0, name: 'lookup', argumentsDelta: '{"q":"x"}' })
-    expect(out.some((item) => item.type === 'finish' && item.reason === 'stop')).toBe(true)
+    // 这一帧里有工具调用，finish 应为 tool_calls 而不是 stop（Gemini 上游给的是 STOP）
+    expect(out.some((item) => item.type === 'finish' && item.reason === 'tool_calls')).toBe(true)
     expect(out.some((item) => item.type === 'usage')).toBe(true)
   })
 
@@ -569,5 +570,78 @@ describe('functionResponse 的 name 用函数名', () => {
     const last = body.contents.at(-1)
     const response = last.parts.find((p: Record<string, unknown>) => p['functionResponse'])
     expect(response.functionResponse.name).toBe('orphan_id')
+  })
+})
+
+/**
+ * 请求体只放官方认识的字段。
+ *
+ * 官方端点对未知字段是**严格**的：多一个就会被拒，而且是在鉴权之前就拒——
+ *
+ *   Invalid JSON payload received. Unknown name "stream": Cannot find field.
+ *
+ * 宽松的兼容网关会忽略多余字段，所以本地对着网关测不出来，只有直连
+ * generativelanguage 才炸。流式由 URL 的 `:streamGenerateContent` 决定；
+ * 模型名在路径里，请求体没有 `model`。
+ */
+describe('请求体不带非标准字段', () => {
+  const target2 = {
+    provider: { id: 'p', name: 'P', protocol: 'gemini' as const, base_url: 'https://h/v1beta', api_key: 'k', enabled: true },
+    model: { alias: 'm', provider: 'p', model: 'gemini-3-flash', enabled: true },
+  }
+
+  it('流式请求不在 body 里塞 stream（只在 URL 上体现）', () => {
+    const built = gemini.buildChat(target2, { messages: [{ role: 'user', content: 'x' }] }, true)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.stream).toBeUndefined()
+    expect(built.url).toContain(':streamGenerateContent')
+  })
+
+  it('body 里没有 model（模型名在 URL 路径里）', () => {
+    const built = gemini.buildChat(target2, { messages: [{ role: 'user', content: 'x' }] }, false)
+    expect(JSON.parse(built.init.body as string).model).toBeUndefined()
+  })
+})
+
+/**
+ * usage 的三个数要对得上：input + output === total。
+ *
+ * Gemini 的 `candidatesTokenCount` **不含**思考 token，而 `totalTokenCount` 含。
+ * 直接透出会让成本核算少算一截（实测 36 + 16 = 52，total 却是 101）。
+ * OpenAI 的 completion_tokens 本来就含推理 token，所以把思考 token 并入 output
+ * 是跨协议一致的口径，不必为此扩展 Usage 契约。
+ */
+describe('usage 含思考 token', () => {
+  it('thoughtsTokenCount 并入 output_tokens，input + output === total', () => {
+    const parsed = gemini.parseResponse({
+      candidates: [{ content: { parts: [{ text: '2' }] }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 36, candidatesTokenCount: 16, totalTokenCount: 101, thoughtsTokenCount: 49 },
+    })
+    expect(parsed.usage).toEqual({ input_tokens: 36, output_tokens: 65, total_tokens: 101 })
+    expect(parsed.usage!.input_tokens! + parsed.usage!.output_tokens!).toBe(parsed.usage!.total_tokens)
+  })
+})
+
+/**
+ * 流式也要把「有工具调用」反映到 finish 上。
+ *
+ * 非流式早已修正，但流式是另一条代码路径，同样直传 STOP 会让调用方
+ * 以为「正常结束」而不再继续跑工具。用真实端点的 SSE 形状验证。
+ */
+describe('流式 finish 识别工具调用', () => {
+  it('有 functionCall 的流，finish.reason 是 tool_calls', async () => {
+    const out = await events([
+      'data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"北京"},"id":"call_1"}}]}}]}\n\n',
+      'data: {"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}]}\n\n',
+    ])
+    const finish = out.find((e) => e.type === 'finish')
+    expect(finish).toMatchObject({ type: 'finish', reason: 'tool_calls' })
+  })
+
+  it('没有工具调用的流，finish.reason 保持 stop', async () => {
+    const out = await events([
+      'data: {"candidates":[{"content":{"parts":[{"text":"你好"}]},"finishReason":"STOP"}]}\n\n',
+    ])
+    expect(out.find((e) => e.type === 'finish')).toMatchObject({ reason: 'stop' })
   })
 })
