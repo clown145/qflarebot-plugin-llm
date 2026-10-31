@@ -5,7 +5,7 @@ import { LIMITS, type StoredConfig } from './config/types.js'
 import { LLMError } from './errors.js'
 import { LLM } from './service.js'
 import { CONFIG_READ_FAILED, fixedStore, type ConfigStore } from './store.js'
-import type { StreamEvent } from './contract.js'
+import type { ChatResult, StreamEvent } from './contract.js'
 
 /** 流式累计上限；与非流式响应体上限（MAX_RESPONSE_BYTES）是两条独立的线 */
 const STREAM_MAX_BYTES = LIMITS.stream_max_bytes
@@ -107,6 +107,56 @@ describe('LLM.chat', () => {
 })
 
 describe('LLM.stream', () => {
+  it.each([
+    ['openai', { choices: [{ delta: { content: 'partial' } }] }],
+    ['openai', { choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'lookup', arguments: '{' } }] } }] }],
+    ['anthropic', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } }],
+    ['gemini', { candidates: [{ content: { parts: [{ text: 'partial' }] } }] }],
+  ] as const)('%s 在结束标记之前 EOF 会失败，不能产出成功 done', async (protocol, chunk) => {
+    const value = config()
+    value.providers[0]!.protocol = protocol
+    const llm = client(vi.fn(async () => sseResponse([`data: ${JSON.stringify(chunk)}\n\n`])), value)
+    const events: StreamEvent[] = []
+    await expect((async () => {
+      for await (const event of llm.stream({ messages: [{ role: 'user', content: 'x' }] })) events.push(event)
+    })()).rejects.toMatchObject({ code: 'bad_response', provider: 'p', alias: 'chat' })
+    expect(events.some((event) => event.type === 'done')).toBe(false)
+  })
+
+  it.each([
+    ['openai', 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'],
+    ['openai', 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'],
+    ['anthropic', 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'],
+    ['gemini', 'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}\n\n'],
+  ] as const)('%s 的正常结束标记仍可完成响应', async (protocol, chunk) => {
+    const value = config()
+    value.providers[0]!.protocol = protocol
+    const llm = client(vi.fn(async () => sseResponse([chunk])), value)
+    const events: StreamEvent[] = []
+    for await (const event of llm.stream({ messages: [{ role: 'user', content: 'x' }] })) events.push(event)
+    expect(events.at(-1)?.type).toBe('done')
+  })
+
+  it.each([false, true])('空 reasoning_content 在非流式/流式结果及工具回填中不丢失：stream=%s', async (stream) => {
+    const tool = { id: 'c1', type: 'function', function: { name: 'lookup', arguments: '{}' } }
+    const fetchMock = vi.fn<typeof fetch>(async (_url, init) => JSON.parse(init!.body as string).stream
+      ? sseResponse([`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: '', tool_calls: [{ index: 0, ...tool }] }, finish_reason: 'tool_calls' }] })}\n\n`])
+      : jsonResponse({ choices: [{ message: { content: '', reasoning_content: '', tool_calls: [tool] }, finish_reason: 'tool_calls' }] }))
+    const llm = client(fetchMock)
+    const request = { messages: [{ role: 'user' as const, content: 'x' }] }
+    let response: ChatResult | undefined
+    if (stream) {
+      for await (const event of llm.stream(request)) if (event.type === 'done') response = event.result
+    } else response = await llm.chat(request)
+    expect(response?.reasoning).toBe('')
+    await llm.chat({ messages: [...request.messages,
+      { role: 'assistant', content: response!.text, reasoning: response!.reasoning, tool_calls: response!.tool_calls },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+    ] })
+    const init = vi.mocked(fetchMock).mock.calls.at(-1)?.[1] as RequestInit | undefined
+    expect(JSON.parse(init!.body as string).messages[1].reasoning_content).toBe('')
+  })
+
   it('把文本、工具参数和 done 结果串起来', async () => {
     const fetchMock = vi.fn().mockResolvedValue(sseResponse([
       'data: {"choices":[{"delta":{"content":"你"}}]}\n\n',

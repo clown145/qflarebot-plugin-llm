@@ -5,7 +5,7 @@ import type { MetadataField, MetadataResolution, ModelCatalog } from '../../src/
 import { resolveModelMetadata, withMetadata } from '../../src/modelMetadata.js'
 import { api, toast } from '../api.js'
 import { confirmDialog, showTestResult } from '../dialogs.js'
-import { badge, clear, field, formatTokenCount, h } from '../dom.js'
+import { badge, clear, field, fieldError, formatTokenCount, h } from '../dom.js'
 import { headerIssues, managedHeaderKeys } from '../headers.js'
 import { timeoutHint, timeoutLimits } from '../limits.js'
 import { catalogProviderFor, loadModelCatalog } from '../modelCatalog.js'
@@ -13,7 +13,7 @@ import { openModelDialog } from '../modelDialog.js'
 import { setPending } from '../pending.js'
 import { aliasBase, isProviderDraftDirty, providerFingerprint, uniqueProviderId } from '../providerDraft.js'
 import { pickProviderPreset } from '../providerTemplateDialog.js'
-import { rebaseProviderDraft } from '../rebase.js'
+import { rebaseProviderDraft, sameValue } from '../rebase.js'
 import { takeDroppedSecrets, updateConfig } from '../save.js'
 import { onSavedApplied, state } from '../state.js'
 import type { AppConfigDraft, ProviderDraft } from '../types.js'
@@ -122,6 +122,9 @@ interface MountedRefs {
     keyBanner: HTMLElement
   } | null
 }
+
+let validateProvider: (() => boolean) | null = null
+const openConnections = new Set<string>()
 
 const mounted: MountedRefs = {
   root: null,
@@ -400,7 +403,9 @@ async function addProvider(): Promise<void> {
 async function saveProvider(options: { silent?: boolean } = {}): Promise<boolean> {
   const draft = service.draft
   if (!draft) return false
-  const target = clone(draft)
+  if (validateProvider && !validateProvider()) return false
+  const submitted = clone(draft)
+  const target = clone(submitted)
   target.name = target.name.trim()
   target.base_url = target.base_url.trim()
   if (!target.name) {
@@ -434,13 +439,24 @@ async function saveProvider(options: { silent?: boolean } = {}): Promise<boolean
     },
     { success: options.silent ? undefined : wasNew ? '供应商已添加' : '供应商设置已保存' },
   )
-  if (!ok) return false
+  if (!ok) {
+    const error = mounted.providerCard?.querySelector('.form-error')
+    if (error) error.textContent = '保存失败，修改已保留。请检查配置或网络后重试。'
+    return false
+  }
 
   const saved = state.config?.providers.find((item) => item.id === target.id)
   if (!saved) return false
+  // A refresh-upstream action also saves this form. Keep edits entered while it was waiting.
+  if (service.draft?.id !== saved.id) { refresh('sidebar'); return true }
+  const live = service.draft
+  service.draft = rebaseProviderDraft(live, submitted, saved)
+  if (sameValue(live.api_key, submitted.api_key)) delete service.draft.api_key
+  if (sameValue(live.clear_key, submitted.clear_key)) service.draft.clear_key = false
+  service.draft.api_key_set = saved.api_key_set
   service.selectedId = saved.id
-  service.draft = { ...clone(saved), clear_key: false }
-  service.base = clone(service.draft)
+  service.base = { ...clone(saved), clear_key: false }
+  if (mounted.providerRefs) mounted.providerRefs.key.value = service.draft.api_key ?? ''
   service.baseVersion = state.version
   service.isNew = false
   if (changedConnection) clearAvailable()
@@ -509,12 +525,12 @@ async function testProvider(button: HTMLButtonElement): Promise<void> {
   button.textContent = '测试中…'
   try {
     const data = await api.test({ target: { provider: draft.id }, draft: draftConfig })
-    showTestResult(data.result)
+    showTestResult(data.result, { source: '当前供应商草稿，其余使用已保存配置', baseUrl: draftConfig.providers?.find((item) => item.id === data.result.provider)?.base_url })
   } catch (err) {
     await toast(err instanceof Error ? err.message : String(err), 'error')
   } finally {
     button.disabled = false
-    button.textContent = '测试'
+    button.textContent = '测试当前草稿'
   }
 }
 
@@ -728,7 +744,7 @@ async function testModel(model: ModelConfig, button: HTMLButtonElement): Promise
   button.textContent = '测试中…'
   try {
     const data = await api.test({ target: { alias: model.alias }, draft: draftConfig })
-    showTestResult(data.result)
+    showTestResult(data.result, { source: '当前供应商草稿，其余使用已保存配置', baseUrl: draftConfig.providers?.find((item) => item.id === data.result.provider)?.base_url })
   } catch (err) {
     await toast(err instanceof Error ? err.message : String(err), 'error')
   } finally {
@@ -747,8 +763,8 @@ async function setDefault(alias: string): Promise<void> {
   if (ok) refresh('models')
 }
 
-function switchInput(checked: boolean, onChange: (next: boolean) => void): HTMLElement {
-  const box = h('input', { type: 'checkbox', checked })
+function switchInput(checked: boolean, onChange: (next: boolean) => void, label: string): HTMLElement {
+  const box = h('input', { type: 'checkbox', checked, aria: { label } })
   box.addEventListener('change', () => onChange(box.checked))
   return h('label', { class: 'switch' }, box, h('span', { class: 'switch-track' }))
 }
@@ -785,7 +801,7 @@ function mobileProviderSelect(): HTMLElement | null {
   const config = state.config
   if (!config) return null
 
-  const select = h('select', { class: 'qb-input provider-mobile-select' }) as HTMLSelectElement
+  const select = h('select', { class: 'qb-input provider-mobile-select', aria: { label: '选择供应商' } }) as HTMLSelectElement
 
   if (service.isNew && service.draft) {
     const option = h('option', {
@@ -821,7 +837,7 @@ function mobileProviderSelect(): HTMLElement | null {
 }
 
 function serviceHead(): HTMLElement {
-  const segments = h('div', { class: 'segmented', attrs: { role: 'tablist', 'aria-label': '模型服务视图' } })
+  const segments = h('div', { class: 'segmented', attrs: { role: 'group', 'aria-label': '模型服务视图' } })
   const modes: Array<{ id: Mode; label: string }> = [
     { id: 'workbench', label: '按供应商' },
     { id: 'aliases', label: '全部别名' },
@@ -831,7 +847,7 @@ function serviceHead(): HTMLElement {
       class: `segment${service.mode === item.id ? ' active' : ''}`,
       type: 'button',
       text: item.label,
-      aria: { selected: String(service.mode === item.id) },
+      aria: { pressed: String(service.mode === item.id) },
     })
     button.addEventListener('click', () => {
       if (service.mode === item.id) return
@@ -851,8 +867,8 @@ function serviceHead(): HTMLElement {
         class: 'hint',
         text:
           service.mode === 'aliases'
-            ? '不区分供应商地检查全部别名和默认模型；模型改动会立即保存。'
-            : '左边选择供应商；供应商设置需要单独保存，模型改动会立即保存。',
+            ? '不区分供应商地检查全部别名和默认模型；模型编辑后点击保存，启停操作立即生效。'
+            : '选择供应商管理模型；连接设置与模型编辑需要点击保存。',
       }),
     ),
     segments,
@@ -927,7 +943,7 @@ function providerList(): HTMLElement {
 function sidebar(): HTMLElement {
   const config = state.config
   const count = (config?.providers.length ?? 0) + (service.isNew && service.draft ? 1 : 0)
-  const search = h('input', { type: 'search', value: service.providerSearch, placeholder: '筛选供应商' })
+  const search = h('input', { type: 'search', value: service.providerSearch, placeholder: '筛选供应商', aria: { label: '筛选供应商' } })
   const listBox = h('div')
   // 侧栏列表容器登记到引用表：供应商增删/改名/启停时只重建这一块
   mounted.sidebarList = listBox
@@ -1011,7 +1027,7 @@ function buildProviderCard(): HTMLElement {
   const keyBadge = badge('', '')
   const subtitle = h('p', { class: 'hint', text: `${draft.id} · ${protocolLabel(draft.protocol)}` })
 
-  const test = h('button', { class: 'qb-btn', text: '测试', type: 'button' })
+  const test = h('button', { class: 'qb-btn', text: '测试当前草稿', type: 'button' })
   const save = h('button', { class: 'qb-btn qb-btn--primary', text: service.isNew ? '添加供应商' : '保存', type: 'button' })
   save.disabled = !draftDirty()
 
@@ -1023,7 +1039,7 @@ function buildProviderCard(): HTMLElement {
   ]) {
     protocol.append(h('option', { value: item.id, text: item.label, selected: item.id === draft.protocol }))
   }
-  const baseUrl = h('input', { value: draft.base_url, placeholder: 'https://api.example.com/v1' })
+  const baseUrl = h('input', { attrs: { id: 'provider-base-url' }, value: draft.base_url, placeholder: 'https://api.example.com/v1' })
   const baseHint = h('span', { class: 'desc', text: meta?.base_url_hint ?? '' })
   const limits = timeoutLimits()
   const timeout = h('input', {
@@ -1036,12 +1052,12 @@ function buildProviderCard(): HTMLElement {
     type: 'password',
     value: draft.api_key ?? '',
     placeholder: draft.api_key_set && !draft.clear_key ? '已设置，留空保持不变' : '未设置',
-    attrs: { autocomplete: 'new-password' },
+    attrs: { autocomplete: 'new-password', id: 'provider-api-key' },
   })
   const clearKey = h('button', { class: 'qb-btn qb-btn--sm', text: draft.clear_key ? '撤销清除' : '清除', type: 'button' })
   clearKey.disabled = !draft.api_key_set && !draft.api_key && !draft.clear_key
-  const headers = h('textarea', { rows: 3, value: formatHeaders(draft.headers), placeholder: 'X-Title: QFlareBot\nHTTP-Referer: https://example.com' })
-  const headersHint = h('span', { class: 'desc', text: '每行 Key: Value。只放非密钥头；Authorization / x-api-key 由 API Key 自动生成。' })
+  const headers = h('textarea', { aria: { label: '额外请求头', describedby: 'provider-headers-hint' }, rows: 3, value: formatHeaders(draft.headers), placeholder: 'X-Title: QFlareBot\nHTTP-Referer: https://example.com' })
+  const headersHint = h('span', { attrs: { id: 'provider-headers-hint' }, class: 'desc', text: '每行 Key: Value。只放非密钥头；Authorization / x-api-key 由 API Key 自动生成。' })
   const headersBox = h(
     'details',
     { class: 'advanced' },
@@ -1214,21 +1230,35 @@ function buildProviderCard(): HTMLElement {
   })
 
   test.addEventListener('click', () => {
-    if (test.disabled) return
+    if (test.disabled || !validateProvider?.()) return
     void testProvider(test)
   })
-  save.addEventListener('click', () => {
-    if (save.disabled) return
-    if (!validateHeaders()) {
-      void toast('Authorization / x-api-key 由 API Key 自动生成，不要在这里填写', 'warning')
-      return
+  const errorSummary = h('p', { class: 'form-error', attrs: { role: 'alert' } })
+  validateProvider = () => {
+    if (!name.value.trim()) { fieldError(name, '请填写供应商名称'); return false }
+    if (name.value.trim().length > 60) { fieldError(name, '名称最多 60 个字符'); return false }
+    try {
+      const url = new URL(baseUrl.value.trim())
+      if (!['http:', 'https:'].includes(url.protocol)) throw new Error()
+    } catch { fieldError(baseUrl, '请输入完整的 HTTP 或 HTTPS 接口地址'); return false }
+    if (timeout.validity.badInput || (timeout.value && (!Number.isInteger(Number(timeout.value)) || Number(timeout.value) < limits.min || Number(timeout.value) > limits.max))) {
+      fieldError(timeout, `超时应为 ${limits.min}–${limits.max} 毫秒之间的整数`); return false
     }
-    save.disabled = true
+    if (!validateHeaders()) { fieldError(headers, headersHint.textContent || '请检查请求头'); return false }
+    errorSummary.textContent = ''
+    return true
+  }
+  save.addEventListener('click', async () => {
+    if (save.disabled || !validateProvider?.()) return
+    const controls = [...card.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>('input, select, textarea, button')]
+    const disabled = controls.map((control) => control.disabled)
+    controls.forEach((control) => { control.disabled = true })
     save.textContent = '保存中…'
-    void saveProvider().finally(() => {
+    try { await saveProvider() } finally {
+      controls.forEach((control, index) => { control.disabled = disabled[index] ?? false })
       save.disabled = !draftDirty()
       save.textContent = service.isNew ? '添加供应商' : '保存'
-    })
+    }
   })
 
   const remove = h('button', { class: 'qb-btn qb-btn--danger qb-btn--sm', text: service.isNew ? '取消新建' : '删除供应商', type: 'button' })
@@ -1237,6 +1267,43 @@ function buildProviderCard(): HTMLElement {
   updateLocal(draft, refs)
   validateHeaders()
 
+  const connection = h('details', { class: 'connection-editor' },
+    h('summary', { text: '编辑连接' }),
+    h(
+      'div',
+      { class: 'grid grid-3' },
+      field('显示名称', name),
+      field('协议', protocol),
+      field('超时（毫秒）', timeout, `留空用默认值（${limits.defaultMs}）；${timeoutHint(limits)}`),
+    ),
+    h('div', { class: 'field provider-url' }, h('label', { text: '接口地址', attrs: { for: 'provider-base-url' } }), baseUrl, baseHint),
+    allowHttpBox,
+    h(
+      'div',
+      { class: 'grid' },
+      h(
+        'div',
+        { class: 'field' },
+        h('label', { text: 'API Key', attrs: { for: 'provider-api-key' } }),
+        h('div', { class: 'key-row' }, key, clearKey),
+        h('span', { class: 'desc', text: '只存在插件 KV 里，页面不回显；不需要认证的接口可以留空。' }),
+      ),
+      headersBox,
+    ),
+    h('div', { class: 'switch-row' }, enabledLabel),
+    h(
+      'div',
+      { class: 'save-bar' },
+      h('span', { class: 'small subtle', text: '连接修改需要点击上方“保存”；测试使用当前草稿。' }),
+      h('div', { class: 'actions' }, remove),
+    ),
+    errorSummary,
+  )
+  connection.open = service.isNew || draftDirty() || openConnections.has(draft.id) || service.keyClearedFor === draft.id
+  connection.addEventListener('toggle', () => {
+    if (connection.open) openConnections.add(draft.id)
+    else openConnections.delete(draft.id)
+  })
   const card = h(
     'div',
     { class: 'qb-card provider-detail' },
@@ -1252,34 +1319,8 @@ function buildProviderCard(): HTMLElement {
       ),
       h('div', { class: 'actions' }, test, save),
     ),
-    h(
-      'div',
-      { class: 'grid grid-3' },
-      field('显示名称', name),
-      field('协议', protocol),
-      field('超时（毫秒）', timeout, `留空用默认值（${limits.defaultMs}）；${timeoutHint(limits)}`),
-    ),
-    h('div', { class: 'field provider-url' }, h('label', { text: '接口地址' }), baseUrl, baseHint),
-    allowHttpBox,
-    h(
-      'div',
-      { class: 'grid' },
-      h(
-        'div',
-        { class: 'field' },
-        h('label', { text: 'API Key' }),
-        h('div', { class: 'key-row' }, key, clearKey),
-        h('span', { class: 'desc', text: '只存在插件 KV 里，页面不回显；不需要认证的接口可以留空。' }),
-      ),
-      headersBox,
-    ),
-    h('div', { class: 'switch-row' }, enabledLabel),
-    h(
-      'div',
-      { class: 'save-bar' },
-      h('span', { class: 'small subtle', text: '供应商设置不会自动保存；模型改动会立即保存。' }),
-      h('div', { class: 'actions' }, remove),
-    ),
+    h('p', { class: 'connection-address mono small', text: draft.base_url || '填写接口地址后保存' }),
+    connection,
   )
   // 登记引用：保存后要局部刷新卡片时靠它定位，不必重建整个内容区
   mounted.providerCard = card
@@ -1290,7 +1331,7 @@ function modelRow(model: ModelConfig): HTMLElement {
   const provider = state.config?.providers.find((item) => item.id === model.provider)
   const config = state.config
   const isDefault = config?.default_model === model.alias
-  const toggle = switchInput(model.enabled, (next) => void toggleModel(model, next))
+  const toggle = switchInput(model.enabled, (next) => void toggleModel(model, next), `启用模型 ${model.alias}`)
   const test = h('button', { class: 'qb-btn qb-btn--sm', text: '测试', type: 'button' })
   test.addEventListener('click', () => void testModel(model, test))
   const edit = h('button', { class: 'qb-btn qb-btn--sm', text: '编辑', type: 'button' })
@@ -1426,7 +1467,7 @@ function buildModelsPanel(): HTMLElement {
   add.disabled = service.adding
   add.addEventListener('click', () => void openAddModel())
 
-  const search = h('input', { type: 'search', value: service.modelSearch, placeholder: '筛选别名、上游模型或能力' })
+  const search = h('input', { type: 'search', value: service.modelSearch, placeholder: '筛选别名、上游模型或能力', aria: { label: '筛选模型' } })
   const rowsBox = h('div')
   const availableBox = h('div')
 
@@ -1470,7 +1511,7 @@ function buildModelsPanel(): HTMLElement {
         'div',
         {},
         h('h3', { text: `模型别名（${all.length}）` }),
-        h('p', { class: 'hint', text: '调用方只认别名；启停、编辑和删除会立即保存。' }),
+        h('p', { class: 'hint', text: '编辑后点击保存；启停和删除立即生效。' }),
       ),
       h('div', { class: 'actions' }, refresh, add),
     ),
@@ -1507,7 +1548,7 @@ function renderAliases(container: HTMLElement): void {
     openModelDialog({ providerId: config.providers[0]!.id, onSaved: () => refresh('models') })
   })
 
-  const search = h('input', { type: 'search', value: service.aliasSearch, placeholder: '筛选别名、供应商或上游模型', class: 'table-search' })
+  const search = h('input', { type: 'search', value: service.aliasSearch, placeholder: '筛选别名、供应商或上游模型', aria: { label: '筛选全部别名' }, class: 'table-search' })
   const tbody = h('tbody')
 
   const renderRows = () => {
@@ -1533,7 +1574,7 @@ function renderAliases(container: HTMLElement): void {
     for (const model of models) {
       const provider = config.providers.find((item) => item.id === model.provider)
       const isDefault = config.default_model === model.alias
-      const toggle = switchInput(model.enabled, (next) => void toggleModel(model, next))
+      const toggle = switchInput(model.enabled, (next) => void toggleModel(model, next), `启用模型 ${model.alias}`)
       const test = h('button', { class: 'qb-btn qb-btn--sm', text: '测试', type: 'button' })
       test.addEventListener('click', () => void testModel(model, test))
       const edit = h('button', { class: 'qb-btn qb-btn--sm', text: '编辑', type: 'button' })
@@ -1598,7 +1639,7 @@ function renderAliases(container: HTMLElement): void {
           'div',
           {},
           h('h2', { text: '全部模型别名' }),
-          h('p', { class: 'hint', text: '不区分供应商，方便检查全局唯一别名和默认模型。模型操作会立即保存。' }),
+          h('p', { class: 'hint', text: '统一查看全部别名与默认模型；编辑后点击保存。' }),
         ),
         h('div', { class: 'actions' }, add),
       ),

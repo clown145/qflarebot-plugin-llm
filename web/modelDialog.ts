@@ -4,7 +4,9 @@ import { CAPABILITY_VALUES, REASONING_EFFORTS, capabilitiesOf, type ReasoningEff
 import type { MetadataField, MetadataResolution, ModelCatalog } from '../src/modelMetadata.js'
 import { resolveModelMetadata, withMetadata } from '../src/modelMetadata.js'
 import { toast } from './api.js'
-import { field, h } from './dom.js'
+import { field, fieldError, h } from './dom.js'
+import { confirmDialog } from './dialogs.js'
+import { setPending } from './pending.js'
 import { catalogProviderFor, loadModelCatalog } from './modelCatalog.js'
 import { aliasBase } from './providerDraft.js'
 import { updateConfig } from './save.js'
@@ -34,6 +36,8 @@ const FIELD_LABELS: Record<MetadataField, string> = {
   capabilities: '能力',
 }
 
+let dialogSeed = 0
+
 const ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,39}$/
 
 export interface ModelDialogOptions {
@@ -43,6 +47,7 @@ export interface ModelDialogOptions {
 }
 
 function readNumber(input: HTMLInputElement, allowZero: boolean, integer: boolean): number | undefined | null {
+  if (input.validity.badInput) return null
   if (!input.value.trim()) return undefined
   const value = Number(input.value)
   if (!Number.isFinite(value) || value < 0) return null
@@ -87,6 +92,15 @@ export function openModelDialog(options: ModelDialogOptions): void {
   let caps = new Set<Capability>(draft.capabilities?.length ? draft.capabilities : capabilitiesOf(protocolOf()))
   caps.add('text')
   let aliasTouched = Boolean(existing)
+  const pendingKey = `model-dialog-${++dialogSeed}`
+  let mounted = false
+  let baseline = ''
+  const snapshot = (): string => JSON.stringify([provider.value, upstream.value, alias.value,
+    contextWindow.value, maxOutput.value, maxTokens.value, temperature.value, effort.value,
+    enabled.checked, [...caps].sort()])
+  function syncDirty(): void {
+    if (mounted) setPending(pendingKey, snapshot() !== baseline)
+  }
 
   const provider = h('select')
   if (draft.provider && !config.providers.some((item) => item.id === draft.provider)) {
@@ -131,6 +145,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
         type: 'button',
         text: LABELS[capability],
         disabled,
+        aria: { pressed: String(caps.has(capability)) },
         title: capability === 'json' && protocol === 'anthropic' ? 'Anthropic 协议不支持 JSON 输出' : undefined,
       })
       if (!disabled) {
@@ -139,6 +154,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
           else caps.add(capability)
           draft.capabilities = CAPABILITY_VALUES.filter((item) => caps.has(item))
           renderCaps()
+          syncDirty()
         })
       }
       capBox.append(chip)
@@ -157,6 +173,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
       caps.add('text')
       renderCaps()
     }
+    syncDirty()
   }
 
   function scopeOf(catalog: ModelCatalog): string | undefined {
@@ -175,7 +192,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
     metaActions.append(retry)
     if (resolution.sources.length <= 1) return
 
-    const source = h('select')
+    const source = h('select', { aria: { label: '模型信息来源' } })
     source.append(h('option', { value: '', text: '选择来源' }))
     for (const item of resolution.sources) source.append(h('option', { value: item, text: item }))
     const apply = h('button', { class: 'qb-btn qb-btn--sm', text: '按来源填充', type: 'button' })
@@ -303,13 +320,22 @@ export function openModelDialog(options: ModelDialogOptions): void {
   const cancelButton = h('button', { class: 'qb-btn', text: '取消', type: 'button' })
   const setSaving = (next: boolean): void => {
     saving = next
+    dialog.setAttribute('aria-busy', String(next))
+    for (const control of dialog.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>('input, select, textarea, button')) {
+      if (next) {
+        control.dataset.wasDisabled = String(control.disabled)
+        control.disabled = true
+      } else control.disabled = control.dataset.wasDisabled === 'true'
+    }
+    if (next) { window.clearTimeout(lookupTimer); lookupSeq += 1 }
     closeButton.disabled = next
     cancelButton.disabled = next
   }
 
+  const errorSummary = h('p', { class: 'form-error', attrs: { role: 'alert' } })
   const dialog = h(
     'dialog',
-    { class: 'model-dialog' },
+    { class: 'model-dialog', aria: { label: existing ? '编辑模型' : '添加模型' } },
     h(
       'div',
       { class: 'dialog-body' },
@@ -353,19 +379,22 @@ export function openModelDialog(options: ModelDialogOptions): void {
         ),
       ),
       h('div', { class: 'switch-row' }, switchLabel(enabled, '启用这个别名')),
+      errorSummary,
     ),
     h(
       'div',
       { class: 'dialog-actions' },
-      h('span', { class: 'small subtle', text: '模型改动会自动保存' }),
+      h('span', { class: 'small subtle', text: '点击“保存并应用”后生效' }),
       h('div', { style: 'flex:1' }),
       cancelButton,
       (() => {
         const save = h('button', { class: 'qb-btn qb-btn--primary', text: '保存并应用', type: 'button' })
         save.addEventListener('click', async () => {
           if (saving) return
+          errorSummary.textContent = ''
           let nextAlias = alias.value.trim()
           const nextModel = upstream.value.trim()
+          if (!nextModel) { fieldError(upstream, '请填写上游模型名'); return }
           // README 承诺「留空会按模型名自动生成」：手动清空后保存同样回填，
           // 而不是只在输入上游模型名时实时同步（syncAlias 只在 aliasTouched=false 时跑）
           if (!nextAlias && nextModel) {
@@ -373,23 +402,19 @@ export function openModelDialog(options: ModelDialogOptions): void {
             alias.value = nextAlias
           }
           if (!nextAlias) {
-            await toast('模型别名不能为空：请填写别名或上游模型名', 'warning')
+            fieldError(alias, '请填写别名或上游模型名')
             return
           }
           if (!ALIAS_PATTERN.test(nextAlias)) {
-            await toast('别名只能用字母、数字、.、_、:、-，且以字母或数字开头', 'warning')
+            fieldError(alias, '别名需以字母或数字开头，只能用字母、数字、.、_、:、-，最多 40 个字符')
             return
           }
-          if (config.models.some((item) => item.alias === nextAlias && item !== existing)) {
-            await toast(`模型别名 ${nextAlias} 已存在`, 'warning')
-            return
-          }
-          if (!nextModel) {
-            await toast('上游模型名不能为空', 'warning')
+          if (config.models.some((item) => item.alias === nextAlias && !(item.alias === originalAlias && item.provider === originalProvider))) {
+            fieldError(alias, `模型别名 ${nextAlias} 已存在`)
             return
           }
           if (!config.providers.some((item) => item.id === draft.provider)) {
-            await toast('供应商不存在，请重新选择', 'warning')
+            fieldError(provider, '供应商不存在，请重新选择')
             return
           }
           const tokens = readNumber(maxTokens, false, true)
@@ -397,23 +422,24 @@ export function openModelDialog(options: ModelDialogOptions): void {
           const context = readNumber(contextWindow, false, true)
           const output = readNumber(maxOutput, false, true)
           if (tokens === null || temp === null || context === null || output === null) {
-            await toast('数值不合法', 'warning')
+            const invalid = tokens === null ? maxTokens : temp === null ? temperature : context === null ? contextWindow : maxOutput
+            fieldError(invalid, invalid === temperature ? '请输入 0–2 之间的数字' : '请输入大于 0 的整数')
             return
           }
           if (tokens !== undefined && tokens > (state.meta?.limits.max_tokens_max ?? 131072)) {
-            await toast('默认 max_tokens 超出上限', 'warning')
+            fieldError(maxTokens, '默认 max_tokens 超出上限')
             return
           }
           if (temp !== undefined && temp > 2) {
-            await toast('温度应在 0–2 之间', 'warning')
+            fieldError(temperature, '温度应在 0–2 之间')
             return
           }
           if (context !== undefined && context > 10_000_000) {
-            await toast('上下文窗口超出上限', 'warning')
+            fieldError(contextWindow, '上下文窗口超出上限')
             return
           }
           if (output !== undefined && output > 1_000_000) {
-            await toast('模型输出上限超出上限', 'warning')
+            fieldError(maxOutput, '模型输出上限超出上限')
             return
           }
 
@@ -440,8 +466,7 @@ export function openModelDialog(options: ModelDialogOptions): void {
                 (item) => item.alias === originalAlias && item.provider === originalProvider,
               ) === true)
           if (!stillThere) {
-            await toast('这个模型已被别处修改，请刷新后重试', 'error')
-            dialog.close()
+            errorSummary.textContent = '这个模型已被别处修改。草稿已保留，请核对最新配置后重试。'
             return
           }
 
@@ -477,11 +502,14 @@ export function openModelDialog(options: ModelDialogOptions): void {
             save.textContent = '保存并应用'
           }
           if (stale) {
-            await toast('这个模型已被别处修改，请刷新后重试', 'error')
-            dialog.close()
+            errorSummary.textContent = '这个模型已被别处修改。草稿已保留，请核对最新配置后重试。'
             return
           }
-          if (!ok) return
+          if (!ok) {
+            errorSummary.textContent = '保存失败，输入已保留。请检查配置或网络后重试。'
+            syncDirty()
+            return
+          }
           // 先关弹窗再回调：回调会触发整页重渲染，弹窗先关掉避免闪一下
           dialog.close()
           options.onSaved?.()
@@ -491,25 +519,37 @@ export function openModelDialog(options: ModelDialogOptions): void {
     ),
   )
 
-  closeButton.addEventListener('click', () => {
-    if (saving) return
+  let confirming = false
+  const requestClose = async (): Promise<void> => {
+    if (saving || confirming) return
+    if (snapshot() !== baseline) {
+      confirming = true
+      const discard = await confirmDialog('模型有未保存的修改，关闭将丢弃这些修改。', '放弃修改', '继续编辑')
+      confirming = false
+      if (!discard) return
+    }
     dialog.close()
-  })
-  cancelButton.addEventListener('click', () => {
-    if (saving) return
-    dialog.close()
-  })
-  // Esc / 浏览器默认关闭走 cancel 事件；保存中拦掉，避免请求飞行中弹窗消失
+  }
+  closeButton.addEventListener('click', () => void requestClose())
+  cancelButton.addEventListener('click', () => void requestClose())
   dialog.addEventListener('cancel', (event) => {
-    if (!saving) return
     event.preventDefault()
+    void requestClose()
   })
+  dialog.addEventListener('input', syncDirty)
+  dialog.addEventListener('change', syncDirty)
   dialog.addEventListener('close', () => {
+    mounted = false
+    setPending(pendingKey, false)
     window.clearTimeout(lookupTimer)
+    lookupSeq += 1
     dialog.remove()
   })
+  baseline = snapshot()
+  mounted = true
   document.body.append(dialog)
   dialog.showModal()
+  upstream.focus()
   scheduleLookup()
 }
 

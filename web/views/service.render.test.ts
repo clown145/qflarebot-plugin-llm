@@ -80,6 +80,7 @@ vi.mock('../modelDialog.js', () => ({ openModelDialog: vi.fn() }))
 vi.mock('../providerTemplateDialog.js', () => ({ pickProviderPreset: vi.fn(async () => null) }))
 vi.mock('../modelCatalog.js', () => ({ catalogProviderFor: vi.fn(() => undefined), loadModelCatalog: vi.fn(async () => null) }))
 
+import { updateConfig } from '../save.js'
 import { renderService, resetServiceState } from './service.js'
 
 /** 等一轮微任务，让 click 里的 async 处理器跑完 */
@@ -95,7 +96,7 @@ function saveButton(root: HTMLElement): HTMLButtonElement {
 }
 
 function testButton(root: HTMLElement): HTMLButtonElement {
-  return [...root.querySelectorAll('button')].find((b) => b.textContent === '测试') as HTMLButtonElement
+  return [...root.querySelectorAll('button')].find((b) => b.textContent === '测试当前草稿') as HTMLButtonElement
 }
 
 describe('保存不重建 DOM', () => {
@@ -171,6 +172,31 @@ describe('保存后仍能继续编辑并保存（P1-9 回归）', () => {
     expect(providers[0]?.['name']).toBe('P1-第二次')
   })
 
+  it('a later provider edit survives an in-flight save', async () => {
+    let finish!: () => void
+    vi.mocked(updateConfig).mockImplementationOnce(async (mutate) => {
+      await new Promise<void>((resolve) => { finish = resolve })
+      mutate(mockState.config as never)
+      return true
+    })
+    const root = h('div')
+    document.body.append(root)
+    renderService(root, vi.fn())
+    const input = nameInput(root)
+    input.value = 'submitted'
+    input.dispatchEvent(new Event('input'))
+    saveButton(root).click()
+    input.value = 'typed while waiting'
+    input.dispatchEvent(new Event('input'))
+    finish()
+    await flush()
+    expect(input.value).toBe('typed while waiting')
+    expect(saveButton(root).disabled).toBe(false)
+    saveButton(root).click()
+    await flush()
+    expect((mockState.config.providers as Array<{ name: string }>)[0]?.name).toBe('typed while waiting')
+  })
+
   it('保存后改启停开关也能再次保存（不只是文本输入框）', async () => {
     const root = h('div')
     document.body.append(root)
@@ -209,5 +235,35 @@ describe('保存后仍能继续编辑并保存（P1-9 回归）', () => {
 
     const draft = testCalls.at(-1)?.['draft'] as { providers: Array<Record<string, unknown>> }
     expect(draft.providers[0]?.['name']).toBe('P1-界面上的值')
+  })
+})
+
+
+describe('供应商连接表单', () => {
+  beforeEach(() => { resetServiceState(); document.body.replaceChildren() })
+  it('已有连接默认折叠，修改或验证错误不会丢掉输入', async () => {
+    const root = h('div')
+    document.body.append(root)
+    renderService(root, vi.fn())
+    const connection = root.querySelector<HTMLDetailsElement>('.connection-editor')!
+    // May retain the previous user-open state; explicitly collapse to exercise error recovery.
+    connection.open = false
+    const input = nameInput(root)
+    input.value = ''
+    input.dispatchEvent(new Event('input'))
+    saveButton(root).click()
+    await flush()
+    expect(connection.open).toBe(true)
+    expect(input.getAttribute('aria-invalid')).toBe('true')
+    expect(document.activeElement).toBe(input)
+    expect(input.value).toBe('')
+  })
+  it('all connection controls and model switches have accessible names', () => {
+    const root = h('div')
+    document.body.append(root)
+    renderService(root, vi.fn())
+    for (const input of root.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('input, select, textarea')) {
+      expect(input.getAttribute('aria-label') || input.labels?.[0]?.textContent, input.outerHTML).toBeTruthy()
+    }
   })
 })

@@ -32,6 +32,17 @@ async function events(chunks: string[]): Promise<ParsedStreamEvent[]> {
 }
 
 describe('openai.buildChat', () => {
+  it.each(['先查工具再回答', ''])('回填 assistant 的 reasoning_content，包括空字符串 %j', (reasoning) => {
+    const built = openai.buildChat(target, { messages: [
+      { role: 'assistant', content: '', reasoning, tool_calls: [{ id: 'c1', name: 'lookup', arguments: '{}' }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+      { role: 'assistant', content: '普通回答' },
+    ] }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.messages[0].reasoning_content).toBe(reasoning)
+    expect(body.messages[2]).not.toHaveProperty('reasoning_content')
+  })
+
   it('拼 URL、鉴权与基础字段', () => {
     const built = openai.buildChat(target, { messages: [{ role: 'user', content: 'hi' }] }, false)
     const init = built.init
@@ -116,7 +127,7 @@ describe('openai.parseStream', () => {
       'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
       'data: [DONE] \n\n',
     ])
-    expect(out).toEqual([{ type: 'text_delta', text: 'ok' }])
+    expect(out).toEqual([{ type: 'text_delta', text: 'ok' }, { type: 'end' }])
   })
 })
 

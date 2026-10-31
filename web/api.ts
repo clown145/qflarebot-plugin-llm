@@ -52,10 +52,24 @@ export const api = {
 export async function toast(message: string, level: 'info' | 'success' | 'warning' | 'error' = 'info'): Promise<void> {
   try {
     const bridge = await getBridge()
-    bridge.toast(message, level)
-  } catch {
-    console.warn(message)
+    if (bridge.embedded) {
+      bridge.toast(message, level)
+      return
+    }
+  } catch { /* Standalone preview also needs visible feedback. */ }
+  const host = [...document.querySelectorAll('dialog[open]')].at(-1) ?? document.body
+  let region = host.querySelector(':scope > .toast-region')
+  if (!region) {
+    region = document.createElement('div')
+    region.className = 'toast-region'
+    host.append(region)
   }
+  const item = document.createElement('div')
+  item.className = `local-toast ${level}`
+  item.setAttribute('role', level === 'error' ? 'alert' : 'status')
+  item.textContent = message
+  region.append(item)
+  window.setTimeout(() => { item.remove(); if (!region.childElementCount) region.remove() }, 6000)
 }
 
 export async function setPageTitle(title: string): Promise<void> {

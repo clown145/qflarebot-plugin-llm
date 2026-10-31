@@ -24,8 +24,10 @@ function contentText(content: unknown): string {
 }
 
 /** DeepSeek 用 `reasoning_content`，部分兼容网关用 `reasoning` */
-function reasoningText(raw: Record<string, unknown>): string {
-  return asString(raw['reasoning_content']) || asString(raw['reasoning'])
+function reasoningText(raw: Record<string, unknown>): string | undefined {
+  // 空字符串也是上游明确返回的推理字段，工具回填时仍需保留。
+  if (typeof raw['reasoning_content'] === 'string') return raw['reasoning_content']
+  return typeof raw['reasoning'] === 'string' ? raw['reasoning'] : undefined
 }
 
 /**
@@ -83,6 +85,7 @@ function mapMessages(messages: ChatMessage[]): Record<string, unknown>[] {
         role: 'assistant',
         // 有工具调用又没有文本时 content 得是 null，否则部分上游会报错
         content: content === '' && toolCalls.length ? null : content,
+        ...(message.reasoning !== undefined ? { reasoning_content: message.reasoning } : {}),
         ...(toolCalls.length
           ? {
               tool_calls: toolCalls.map((call) => ({
@@ -187,7 +190,7 @@ function parseResponse(json: unknown): ParsedResponse {
   const usage = openAIUsage(json['usage'])
   return {
     text,
-    ...(reasoning ? { reasoning } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
     ...(toolCalls.length ? { toolCalls } : {}),
     ...(finishReason ? { finishReason } : {}),
     ...(usage ? { usage } : {}),
@@ -240,7 +243,10 @@ async function* parseStream(
   }
   for await (const message of readSSE(body)) {
     // trim：部分代理会给 [DONE] 帧带上尾随空白，严格相等会漏判、落入 JSON.parse 失败
-    if (message.data.trim() === '[DONE]') return
+    if (message.data.trim() === '[DONE]') {
+      yield { type: 'end' }
+      return
+    }
     let json: unknown
     try {
       json = JSON.parse(message.data)
@@ -268,7 +274,7 @@ async function* parseStream(
       if (text) yield { type: 'text_delta', text }
 
       const reasoning = reasoningText(delta)
-      if (reasoning) yield { type: 'reasoning_delta', text: reasoning }
+      if (reasoning !== undefined) yield { type: 'reasoning_delta', text: reasoning }
 
       for (const item of asArray(delta['tool_calls'])) {
         if (!isRecord(item)) continue

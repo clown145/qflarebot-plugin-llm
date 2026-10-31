@@ -18,7 +18,7 @@ export interface SettingsDraftLike {
 }
 
 /** 供应商里由后端保存、可以被 rebase 的字段；api_key / clear_key / api_key_set 单独处理 */
-const PROVIDER_FIELDS = ['name', 'protocol', 'base_url', 'timeout_ms', 'enabled', 'headers'] as const
+const PROVIDER_FIELDS = ['name', 'protocol', 'base_url', 'timeout_ms', 'enabled', 'headers', 'allow_http'] as const
 
 /** 稳定序列化：对象键排序后再比较，避免请求头顺序影响「是否改过」的判断 */
 function stable(value: unknown): string {

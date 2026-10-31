@@ -2,7 +2,7 @@ import { api, toast } from '../api.js'
 import { state } from '../state.js'
 import type { Tab } from '../types.js'
 import { toInput } from '../types.js'
-import { formatTime, h } from '../dom.js'
+import { field, formatTime, h } from '../dom.js'
 import { showTestResult } from '../dialogs.js'
 
 function stat(label: string, value: string): HTMLElement {
@@ -13,12 +13,12 @@ function testOptions(): HTMLSelectElement {
   const select = h('select')
   select.append(h('option', { value: '', text: '默认模型' }))
   const aliases = h('optgroup', { attrs: { label: '模型别名' } })
-  for (const model of state.config?.models ?? []) {
+  for (const model of state.saved?.models ?? []) {
     aliases.append(h('option', { value: `alias:${model.alias}`, text: model.alias || '(未命名)' }))
   }
   if (aliases.childElementCount) select.append(aliases)
   const providers = h('optgroup', { attrs: { label: '供应商（第一个可用模型）' } })
-  for (const provider of state.config?.providers ?? []) {
+  for (const provider of state.saved?.providers ?? []) {
     providers.append(h('option', { value: `provider:${provider.id}`, text: provider.name || provider.id }))
   }
   if (providers.childElementCount) select.append(providers)
@@ -26,7 +26,7 @@ function testOptions(): HTMLSelectElement {
 }
 
 export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void): void {
-  const config = state.config
+  const config = state.saved
   if (!config) return
 
   const enabledProviders = config.providers.filter((item) => item.enabled).length
@@ -74,9 +74,9 @@ export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void
   container.append(issuesCard)
 
   const select = testOptions()
-  const button = h('button', { class: 'qb-btn qb-btn--primary', text: '测试', type: 'button' })
+  const button = h('button', { class: 'qb-btn qb-btn--primary', text: '测试已保存配置', type: 'button' })
   button.addEventListener('click', async () => {
-    if (!state.config) return
+    if (!state.saved) return
     const value = select.value
     const target = value.startsWith('alias:')
       ? { alias: value.slice(6) }
@@ -86,13 +86,14 @@ export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void
     button.disabled = true
     button.textContent = '测试中…'
     try {
-      const data = await api.test({ target, draft: toInput(state.config) })
-      showTestResult(data.result)
+      const saved = toInput(state.saved)
+      const data = await api.test({ target, draft: saved })
+      showTestResult(data.result, { source: '已保存配置', baseUrl: saved.providers?.find((item) => item.id === data.result.provider)?.base_url })
     } catch (err) {
       await toast(err instanceof Error ? err.message : String(err), 'error')
     } finally {
       button.disabled = false
-      button.textContent = '测试'
+      button.textContent = '测试已保存配置'
     }
   })
 
@@ -100,8 +101,8 @@ export function renderOverview(container: HTMLElement, goTab: (tab: Tab) => void
     h(
       'div',
       { class: 'qb-card' },
-      h('div', { class: 'card-head' }, h('div', {}, h('h2', { text: '快速测试' }), h('p', { class: 'hint', text: '会产生一次极小的真实调用；用的是页面当前内容，不需要先保存。' }))),
-      h('div', { class: 'grid' }, h('div', { class: 'field' }, h('label', { text: '测试目标' }), select), h('div', { class: 'field' }, h('label', { text: ' ' }), h('div', {}, button))),
+      h('div', { class: 'card-head' }, h('div', {}, h('h2', { text: '快速测试' }), h('p', { class: 'hint', text: '会产生一次极小的真实调用；用的是已保存配置；未保存的供应商或模型草稿不会参与。' }))),
+      h('div', { class: 'grid' }, field('测试目标', select), h('div', { class: 'field' }, h('label', { text: ' ' }), h('div', {}, button))),
     ),
   )
 

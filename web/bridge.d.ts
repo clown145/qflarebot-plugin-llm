@@ -10,6 +10,7 @@ declare module '*bridge.js' {
     navigate(to: string): void
     setTitle(title: string): void
     resize(height?: number): void
+    setDirty?(dirty: boolean): void
   }
 
   export function createBridge(options?: { timeout?: number; applyTheme?: boolean }): Promise<Bridge>

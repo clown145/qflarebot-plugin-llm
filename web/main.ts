@@ -1,4 +1,4 @@
-import { api, resizePage, setPageTitle, toast } from './api.js'
+import { api, getBridge, resizePage, setPageTitle, toast } from './api.js'
 import { confirmDialog } from './dialogs.js'
 import { clear, download, h } from './dom.js'
 import { clearPending, hasPendingEdits } from './pending.js'
@@ -60,7 +60,7 @@ function header(): HTMLElement {
       'div',
       {},
       h('h1', { text: 'LLM 接口' }),
-      h('p', { class: 'subtitle', text: '配置供应商与模型别名，向其他插件提供 llm 服务；这里不聊天，也不执行工具。' }),
+      h('p', { class: 'subtitle', text: '管理模型连接与别名，保存后供 Agent 等插件调用。' }),
     ),
     h(
       'div',
@@ -68,7 +68,7 @@ function header(): HTMLElement {
       h('span', {
         class: 'badge ok',
         text: '已保存',
-        attrs: { id: 'dirty', title: '模型改动会立即保存；供应商和默认设置需要点页面里的保存' },
+        attrs: { id: 'dirty', title: '供应商、模型编辑和默认设置需要点击保存；启停操作立即生效' },
       }),
       refresh,
       importButton,
@@ -411,12 +411,17 @@ function exportConfig(): void {
 }
 
 function installGuards(): void {
+  const reportDirty = () => {
+    void getBridge().then((bridge) => bridge.setDirty?.(hasPendingEdits() || state.busy)).catch(() => {})
+  }
   window.addEventListener('beforeunload', (event) => {
-    if (!hasPendingEdits()) return
+    if (!hasPendingEdits() && !state.busy) return
     event.preventDefault()
     event.returnValue = ''
   })
   subscribe(updateHeader)
+  subscribe(reportDirty)
+  reportDirty()
 }
 
 async function boot(): Promise<void> {

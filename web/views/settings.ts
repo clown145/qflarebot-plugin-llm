@@ -1,5 +1,4 @@
-import { toast } from '../api.js'
-import { badge, field, h } from '../dom.js'
+import { badge, field, fieldError, h } from '../dom.js'
 import { timeoutHint, timeoutLimits } from '../limits.js'
 import { setPending } from '../pending.js'
 import { rebaseSettingsDraft, type SettingsDraftLike } from '../rebase.js'
@@ -11,6 +10,8 @@ type SettingsDraft = SettingsDraftLike
 
 let draft: SettingsDraft | null = null
 let touched = false
+let saveError = ''
+let mountedError: HTMLElement | null = null
 
 function settingsOf(): SettingsDraft | null {
   const config = state.config
@@ -49,6 +50,7 @@ function syncPending(): void {
 export function resetSettingsDraft(): void {
   draft = null
   touched = false
+  saveError = ''
   setPending('settings', false)
 }
 
@@ -158,6 +160,8 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
 
   const dirtyBadge = badge('未保存', 'warn')
   const save = h('button', { class: 'qb-btn qb-btn--primary', text: '保存设置', type: 'button' })
+  const errorSummary = h('p', { class: 'form-error', text: saveError, attrs: { role: 'alert' } })
+  mountedError = errorSummary
   const reset = h('button', { class: 'qb-btn qb-btn--ghost', text: '放弃修改', type: 'button' })
 
   const updateLocal = () => {
@@ -191,13 +195,17 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
     const next = clone(current)
     const live = timeoutLimits()
     if (!Number.isFinite(next.request_timeout_ms) || next.request_timeout_ms < live.min || next.request_timeout_ms > live.max) {
-      await toast(`超时应在 ${live.min}–${live.max} 毫秒之间`, 'warning')
+      fieldError(timeout, `超时应在 ${live.min}–${live.max} 毫秒之间`)
       return
     }
     if (!Number.isInteger(next.max_retries) || next.max_retries < 0 || next.max_retries > 2) {
-      await toast('重试次数应为 0–2 的整数', 'warning')
+      fieldError(retries, '重试次数应为 0–2 的整数')
       return
     }
+    if (next.default_model && !state.config?.models.some((model) => model.alias === next.default_model)) { fieldError(defaultModel, '模型别名已不存在，请重新选择'); return }
+    saveError = ''
+    errorSummary.textContent = ''
+    for (const control of [defaultModel, timeout, retries, reset]) control.disabled = true
     save.disabled = true
     save.textContent = '保存中…'
     const ok = await updateConfig(
@@ -209,13 +217,20 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
       { success: '默认设置已保存' },
     )
     save.textContent = '保存设置'
-    if (!ok) return
+    for (const control of [defaultModel, timeout, retries, reset]) control.disabled = false
+    if (!ok) {
+      saveError = '保存失败，修改已保留，请重试。'
+      if (mountedError) mountedError.textContent = saveError
+      updateLocal()
+      return
+    }
     touched = false
     draft = settingsOf()
     syncPending()
     rerender?.()
   })
   reset.addEventListener('click', () => {
+    saveError = ''
     touched = false
     draft = settingsOf()
     syncPending()
@@ -241,7 +256,7 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
     h(
       'div',
       { class: 'grid grid-3' },
-      h('div', { class: 'field' }, h('label', { text: '默认模型别名' }), defaultModel, defaultHint),
+      h('div', {}, field('默认模型别名', defaultModel), defaultHint),
       field('默认超时（毫秒）', timeout, `${timeoutHint(limits)}；默认 ${limits.defaultMs}`),
       field('失败重试次数', retries, '0–2；只对限流、5xx、网络错误重试'),
     ),
@@ -254,6 +269,7 @@ export function renderSettings(container: HTMLElement, rerender?: () => void): v
     ),
   )
 
+  card.append(errorSummary)
   container.append(card)
 
   const protocols = state.meta?.protocols ?? []

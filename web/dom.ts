@@ -69,13 +69,49 @@ let fieldIdSeed = 0
 export function field(label: string, control: HTMLElement, desc?: string): HTMLElement {
   fieldIdSeed += 1
   if (!control.id) control.id = `field-${fieldIdSeed}`
+  if (desc) control.setAttribute('aria-describedby', `${control.id}-hint`)
   return h(
     'div',
     { class: 'field' },
     h('label', { text: label, attrs: { for: control.id } }),
     control,
-    desc ? h('span', { class: 'desc', text: desc }) : null,
+    desc ? h('span', { class: 'desc', text: desc, attrs: { id: `${control.id}-hint` } }) : null,
   )
+}
+
+/** Keep validation next to the input and expose it to keyboard and screen-reader users. */
+export function fieldError(control: HTMLElement, message: string, focus = true): void {
+  if (!control.id) control.id = `field-${++fieldIdSeed}`
+  const id = `${control.id}-error`
+  let error = document.getElementById(id)
+  if (!error) {
+    error = h('span', { class: 'field-error', attrs: { id, role: 'alert' } })
+    const wrapper = control.closest('.field')
+    if (wrapper) wrapper.append(error)
+    else control.after(error)
+  }
+  error.textContent = message
+  control.setAttribute('aria-invalid', 'true')
+  const described = new Set((control.getAttribute('aria-describedby') ?? '').split(' ').filter(Boolean))
+  described.add(id)
+  control.setAttribute('aria-describedby', [...described].join(' '))
+  const clearError = () => {
+    error?.remove()
+    control.removeAttribute('aria-invalid')
+    described.delete(id)
+    if (described.size) control.setAttribute('aria-describedby', [...described].join(' '))
+    else control.removeAttribute('aria-describedby')
+    control.removeEventListener('input', clearError)
+    control.removeEventListener('change', clearError)
+  }
+  control.addEventListener('input', clearError, { once: true })
+  control.addEventListener('change', clearError, { once: true })
+  if (focus) {
+    for (let parent = control.parentElement; parent; parent = parent.parentElement) {
+      if (parent instanceof HTMLDetailsElement) parent.open = true
+    }
+    control.focus()
+  }
 }
 
 export function badge(text: string, kind: 'ok' | 'warn' | 'err' | '' = ''): HTMLElement {

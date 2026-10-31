@@ -13,7 +13,7 @@ export function dialogShell(title: string, onClose?: () => void, className = '')
   const close = h('button', { class: 'qb-btn qb-btn--ghost qb-btn--sm', text: '关闭', type: 'button' })
   const dialog = h(
     'dialog',
-    { class: className },
+    { class: className, aria: { label: title } },
     h(
       'div',
       { class: 'dialog-body' },
@@ -32,8 +32,10 @@ export function dialogShell(title: string, onClose?: () => void, className = '')
   return { dialog, body, actions }
 }
 
-export function showTestResult(result: PingResult): void {
+export function showTestResult(result: PingResult, context?: { source: string; baseUrl?: string }): void {
   const view = dialogShell('测试结果')
+  if (context) view.body.append(h('p', { class: 'hint', text: `配置来源：${context.source}` }),
+    h('p', { class: 'small mono test-address', text: `接口地址：${context.baseUrl || '—'}` }))
   view.body.append(
     h(
       'div',
@@ -67,7 +69,7 @@ function kv(label: string, value: HTMLElement): HTMLElement {
   return h('div', {}, h('div', { class: 'small muted', text: label }), h('div', { class: 'value' }, value))
 }
 
-export function confirmDialog(message: string, confirmText = '确定'): Promise<boolean> {
+export function confirmDialog(message: string, confirmText = '确定', cancelText = '取消'): Promise<boolean> {
   return new Promise((resolve) => {
     let done = false
     let view!: DialogShell
@@ -79,9 +81,11 @@ export function confirmDialog(message: string, confirmText = '确定'): Promise<
     }
     view = dialogShell('确认', () => finish(false))
     view.body.append(h('p', { text: message }))
+    const cancel = h('button', { class: 'qb-btn', text: cancelText, type: 'button', on: { click: () => finish(false) } })
     view.actions.append(
-      h('button', { class: 'qb-btn', text: '取消', type: 'button', on: { click: () => finish(false) } }),
+      cancel,
       h('button', { class: 'qb-btn qb-btn--danger', text: confirmText, type: 'button', on: { click: () => finish(true) } }),
     )
+    cancel.focus()
   })
 }

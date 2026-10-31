@@ -507,6 +507,24 @@ describe('gemini 的 generateContent 地址拼接', () => {
   const urlOf = (base_url: string, model?: string, stream = false) =>
     gemini.buildChat(target2(base_url, model), { messages: [{ role: 'user', content: 'hi' }] }, stream).url
 
+  it.each([
+    '/v1beta',
+    '/v1beta/models/gemini-3-flash',
+    '/v1beta/models/gemini-3-flash:generateContent',
+    '/v1beta/models/gemini-3-flash:streamGenerateContent',
+  ])('带查询参数和 fragment 的地址仍有正确端点与 SSE 参数：%s', (path) => {
+    const base = `https://proxy.example${path}?key=a%2Bb&alt=json#fragment`
+    const stream = new URL(urlOf(base, undefined, true))
+    expect(stream.pathname).toBe('/v1beta/models/gemini-3-flash:streamGenerateContent')
+    expect(stream.searchParams.get('key')).toBe('a+b')
+    expect(stream.searchParams.get('alt')).toBe('sse')
+    expect(stream.hash).toBe('#fragment')
+    const chat = new URL(urlOf(stream.toString()))
+    expect(chat.pathname).toBe('/v1beta/models/gemini-3-flash:generateContent')
+    expect(chat.searchParams.get('key')).toBe('a+b')
+    expect(chat.searchParams.has('alt')).toBe(false)
+  })
+
   it('常规 base_url：补 /models/{model}:generateContent（模型名必须在路径里）', () => {
     expect(urlOf('https://generativelanguage.googleapis.com/v1beta')).toBe(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent',

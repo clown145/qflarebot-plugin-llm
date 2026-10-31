@@ -39,6 +39,8 @@ export type ParsedStreamEvent =
   | ({ type: 'reasoning_signature' } & ReasoningSignature)
   | { type: 'usage'; usage: Usage }
   | { type: 'finish'; reason?: FinishReason }
+  /** 协议级结束标记（OpenAI [DONE] / Anthropic message_stop），不是连接 EOF。 */
+  | { type: 'end' }
 
 /** 解析流式数据时用得上的上游上下文；只有需要脱敏/映射错误的适配器才会用 */
 export interface StreamContext {

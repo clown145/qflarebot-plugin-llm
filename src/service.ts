@@ -156,6 +156,8 @@ export class LLM implements LLMService {
 
     let text = ''
     let reasoning = ''
+    let hasReasoning = false
+    let ended = false
     /** Gemini 思考签名集合（文本与工具调用 part）；调用方要保存并在下一轮回传 */
     const thoughtSignatures: ThoughtSignature[] = []
     /** Anthropic 思考签名集合（thinking / redacted_thinking）；多轮工具调用必须回传 */
@@ -192,6 +194,7 @@ export class LLM implements LLMService {
           text += event.text
           yield { type: 'text_delta', text: event.text }
         } else if (event.type === 'reasoning_delta') {
+          hasReasoning = true
           count(event.text)
           reasoning += event.text
           yield { type: 'reasoning_delta', text: event.text }
@@ -242,7 +245,16 @@ export class LLM implements LLMService {
           usage = mergeUsage(usage, event.usage)
         } else if (event.type === 'finish') {
           finishReason = event.reason
+        } else if (event.type === 'end') {
+          ended = true
         }
+      }
+      // EOF 只代表连接关闭；没有协议结束标记或 finish reason 时不能提交残缺结果。
+      if (!ended && !finishReason) {
+        throw new LLMError('bad_response', '上游流式响应提前结束，未收到完成标记', {
+          provider: prepared.provider.id,
+          alias: prepared.model.alias,
+        })
       }
     } catch (err) {
       let error: LLMError
@@ -289,7 +301,7 @@ export class LLM implements LLMService {
       prepared,
       {
         text,
-        ...(reasoning ? { reasoning } : {}),
+        ...(hasReasoning ? { reasoning } : {}),
         ...(thoughtSignatures.length ? { thoughtSignatures } : {}),
         ...(reasoningSignatures.length ? { reasoningSignatures } : {}),
         ...(toolCalls.length ? { toolCalls } : {}),
@@ -558,7 +570,7 @@ export class LLM implements LLMService {
     const reasoningSignatures = parsed.reasoningSignatures?.length ? parsed.reasoningSignatures : undefined
     return {
       text: parsed.text,
-      ...(parsed.reasoning ? { reasoning: parsed.reasoning } : {}),
+      ...(parsed.reasoning !== undefined ? { reasoning: parsed.reasoning } : {}),
       ...(mapped.thoughtSignatures?.length ? { thought_signatures: mapped.thoughtSignatures } : {}),
       ...(reasoningSignatures ? { reasoning_signatures: reasoningSignatures } : {}),
       ...(toolCalls ? { tool_calls: toolCalls } : {}),

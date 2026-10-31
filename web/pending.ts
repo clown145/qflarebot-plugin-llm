@@ -2,7 +2,7 @@ import { emit } from './state.js'
 
 const sections = new Set<string>()
 
-/** 页面内还没有提交到 KV 的编辑；模型增删改不算，它们会立即保存。 */
+/** 页面内还没有提交的编辑，包括尚未保存的模型弹窗。 */
 export function setPending(section: string, dirty: boolean): void {
   const had = sections.has(section)
   if (dirty === had) return

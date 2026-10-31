@@ -657,39 +657,17 @@ async function* parseStream(
  * 用户复制粘贴时也会带），否则会拼出 `/models/models/xxx`。
  */
 function generateContentUrl(baseUrl: string, modelName: string, stream: boolean): string {
-  const method = stream ? ':streamGenerateContent' : ':generateContent'
-  const query = stream ? '?alt=sse' : ''
-  const base = baseUrl.trim().replace(/\/+$/, '')
-
-  // 情况 3：base_url 已经是完整端点。非流式原样用；
-  // 流式要把方法换成 streamGenerateContent 再补 alt=sse——只加查询参数
-  // 等于还在调非流式端点，拿回来的是普通 JSON 而不是 SSE 流。
-  if (base.endsWith(':generateContent') || base.endsWith(':streamGenerateContent')) {
-    if (!stream) return base
-    const switched = base
-      .replace(/:generateContent/, ':streamGenerateContent')
-      .replace(/:streamGenerateContent\?alt=sse/, ':streamGenerateContent')
-    return switched.includes('alt=sse')
-      ? switched
-      : `${switched}${switched.includes('?') ? '&' : '?'}alt=sse`
+  const url = new URL(baseUrl.trim())
+  // 先分离路径与查询串，再切换端点，避免把方法后缀拼进 key 等参数里。
+  let path = url.pathname.replace(/\/+$/, '').replace(/:(?:streamGenerateContent|generateContent)$/, '')
+  if (!/\/models\/[^/]+$/.test(path)) {
+    const model = modelName.trim().replace(/^models\//, '')
+    path += `/models/${model}`
   }
-
-  // 模型名去掉 models/ 前缀，避免拼出 /models/models/xxx
-  const model = modelName.trim().replace(/^models\//, '')
-
-  // 情况 2：base_url 里已经写到了 models/{某个模型}，只补方法后缀
-  if (/\/models\/[^/]+$/.test(base)) {
-    return `${base}${method}${query}`
-  }
-
-  // 情况 1：常规形态，注意 base 可能带 ?key= 之类的查询串
-  const split = base.search(/[?#]/)
-  if (split >= 0) {
-    const path = base.slice(0, split).replace(/\/+$/, '')
-    const suffix = base.slice(split)
-    return `${path}/models/${model}${method}${suffix}`
-  }
-  return `${base}/models/${model}${method}${query}`
+  url.pathname = `${path}:${stream ? 'streamGenerateContent' : 'generateContent'}`
+  if (stream) url.searchParams.set('alt', 'sse')
+  else if (url.searchParams.get('alt') === 'sse') url.searchParams.delete('alt')
+  return url.toString()
 }
 
 function buildListModels(provider: ProviderConfig): BuiltRequest {

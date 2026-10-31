@@ -115,8 +115,8 @@ export interface ChatMessage {
   is_error?: boolean
   /**
    * assistant 消息里的推理内容（DeepSeek reasoning_content / Anthropic thinking）。
-   * 只是一段展示用的纯文本，不会回传到上游；Anthropic 的思考 block 回传走
-   * `reasoning_signatures`（签名与正文必须成对，纯文本装不下签名）。
+   * OpenAI 兼容协议原样回填为 reasoning_content（DeepSeek 思考工具调用必需）；
+   * Anthropic 的思考 block 回传走 `reasoning_signatures`，正文与签名必须成对。
    */
   reasoning?: string
   /**

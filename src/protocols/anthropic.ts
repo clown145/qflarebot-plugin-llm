@@ -558,7 +558,10 @@ async function* parseStream(
       continue
     }
 
-    if (event === 'message_stop') return
+    if (event === 'message_stop') {
+      yield { type: 'end' }
+      return
+    }
     if (event === 'error') {
       const error = isRecord(json['error']) ? json['error'] : {}
       // 走统一的流内错误映射：message 必须脱敏，上游常把 key 原样回显在里面
