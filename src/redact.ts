@@ -13,23 +13,41 @@ const MIN_SECRET_LENGTH = 6
 
 /** 常见凭据前缀；命中后整段替换成 `***` */
 const CREDENTIAL_PATTERNS: ReadonlyArray<RegExp> = [
-  // OpenAI / Anthropic / 各类兼容网关：sk-…、sk-ant-…、sk-proj-…、sk-or-v1-…
+  // OpenAI / Anthropic / 各类兼容网关：sk-…、sk-ant-…、sk-proj-…、sk-or-v1-…、sk_live_…
   /\bsk-[A-Za-z0-9_-]{8,}/g,
+  /\bsk_live_[A-Za-z0-9]{8,}/g,
+  // Groq（gsk_）、Cerebras（csk-）、Perplexity（pplx-）、xAI（xai-）、NVIDIA（nvapi-）、
+  // Tavily（tvly-）、Firecrawl（fc-）、Groq Cloud（gsk_）
+  /\bgsk_[A-Za-z0-9]{8,}/g,
+  /\bcsk-[A-Za-z0-9_-]{8,}/g,
+  /\bpplx-[A-Za-z0-9]{8,}/g,
+  /\bxai-[A-Za-z0-9]{8,}/g,
+  /\bnvapi-[A-Za-z0-9_-]{8,}/g,
+  /\btvly-[A-Za-z0-9_-]{8,}/g,
+  /\bfc-[A-Za-z0-9]{16,}/g,
   // HuggingFace / GitHub / Slack
   /\b(?:hf|gh[pousr]|xox[abposr])_[A-Za-z0-9_-]{8,}/g,
   // Google API key
   /\bAIza[0-9A-Za-z_-]{20,}/g,
   // AWS access key id
   /\bAKIA[0-9A-Z]{12,}/g,
-  // 智谱 / 阿里云等常见 32 位十六进制风格的 key
+  // 智谱 / 阿里云等常见 32 位十六进制风格的 key（带点号后缀的形式）
   /\b[0-9a-f]{32}\.[0-9A-Za-z]{8,}/g,
+  // 裸的 32 位十六进制 key（智谱、部分中转网关）；前后不能再接十六进制字符，避免切坏更长的串
+  /(?<![0-9a-fA-F])[0-9a-f]{32}(?![0-9a-fA-F])/g,
 ]
 
 /** 键值上下文里的凭据：`Bearer <token>`、`x-api-key: <token>`、`"api_key": "<token>"` */
 const CONTEXT_PATTERNS: ReadonlyArray<{ pattern: RegExp; mask: string }> = [
   { pattern: /(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, mask: '$1***' },
   { pattern: /(\bx-api-key["'\s:=]+)[A-Za-z0-9._~+/=-]{8,}/gi, mask: '$1***' },
-  { pattern: /(\b(?:api[_-]?key|access[_-]?token|secret[_-]?key)["'\s:=]+)[A-Za-z0-9._~+/=-]{8,}/gi, mask: '$1***' },
+  // Google 的鉴权头，Anthropic 之外的 Gemini 上游都认
+  { pattern: /(\bx-goog-api-key["'\s:=]+)[A-Za-z0-9._~+/=-]{8,}/gi, mask: '$1***' },
+  // 常见第三方鉴权头（Azure `api-key`、HF token、自定义 auth）
+  { pattern: /(\b(?:api-key|auth-token|access-token|x-auth-token|x-hf-token|x-custom-auth)["'\s:=]+)[A-Za-z0-9._~+/=-]{8,}/gi, mask: '$1***' },
+  { pattern: /(\b(?:api[_-]?key|access[_-]?token|secret[_-]?key|client[_-]?secret)["'\s:=]+)[A-Za-z0-9._~+/=-]{8,}/gi, mask: '$1***' },
+  // URL 查询串里的凭据：`?key=…`、`?api_key=…`、`&token=…`（自建/中转网关很常见）
+  { pattern: /([?&](?:key|api_key|apikey|token|access_token|auth)["'\s:=]*)[A-Za-z0-9._~+/=-]{8,}/gi, mask: '$1***' },
 ]
 
 /**

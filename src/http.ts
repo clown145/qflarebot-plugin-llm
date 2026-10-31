@@ -190,3 +190,41 @@ export function truncate(text: string, max = 400): string {
 export function safeDetail(text: string, secrets: ReadonlyArray<string | undefined> = [], max = 400): string {
   return truncate(redactAll(text, secrets), max)
 }
+
+/**
+ * 从 base_url 里抽出**可能是凭据**的片段，加入脱敏列表。
+ *
+ * 很多自建/中转网关把 key 写在地址里（`?key=…`、`?api_key=…`、`#token=…`），
+ * 它们既不是 `api_key` 字段、也不在自定义请求头里，过去的 `fetchError` 因此漏掉了：
+ * 网络错误里带上整条 URL，密钥原样出现在错误消息与日志中。
+ *
+ * 除整段查询串/片段外，还把每个参数的值单独列进去（值本身可能被上游只回显一部分），
+ * 并过滤掉空串与过短的值（太短会把普通单词整段抹掉）。
+ */
+export function urlSecrets(baseUrl: string): string[] {
+  const out = new Set<string>()
+  const raw = baseUrl.trim()
+  if (!raw) return []
+  const split = raw.search(/[?#]/)
+  if (split < 0) return []
+  const suffix = raw.slice(split)
+  if (suffix.length >= 6) out.add(suffix)
+  for (const part of suffix.slice(1).split(/[&#]/)) {
+    const at = part.indexOf('=')
+    if (at < 0) continue
+    const value = part.slice(at + 1)
+    // 值可能是 URL 编码过的，原样与解码后两种形态都收进来
+    for (const candidate of [value, safeDecode(value)]) {
+      if (candidate.length >= 6) out.add(candidate)
+    }
+  }
+  return [...out]
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}

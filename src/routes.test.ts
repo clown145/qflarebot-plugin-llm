@@ -561,3 +561,50 @@ describe('思考等级的存取链路', () => {
     expect(data.config.models[0]?.reasoning_effort).toBe('low')
   })
 })
+
+/**
+ * P1-6 回归：`/api/upstream-models` 的连接失败分支过去只 `truncate` 不脱敏。
+ *
+ * 把密钥放在 base_url 查询串里（`?key=…`）的自建网关很常见：连接失败时 `fetch` 抛的
+ * 错误消息常带整条 URL，密钥原样回给页面（也能被任何人从面板网络面板读到）。
+ * 同函数里 HTTP 非 2xx 分支用的是 `redact(text, api_key)`，同样漏掉了自定义头与查询串。
+ */
+describe('上游模型列表的失败消息必须脱敏（P1-6）', () => {
+  const SECRET = 'abcdef0123456789abcdef0123'
+
+  it('连接失败时 base_url 查询串里的 key 被脱敏', async () => {
+    const ctx = await seeded()
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new TypeError(`getaddrinfo ENOTFOUND https://gw.test/v1?key=${SECRET}`)
+    }))
+    const response = await call('/api/upstream-models', 'POST', {
+      ctx,
+      body: { provider: { id: 'p', protocol: 'openai', base_url: `https://gw.test/v1?key=${SECRET}`, enabled: true } },
+    })
+    expect(response.status).toBe(502)
+    const body = (await response.json()) as { error: string }
+    expect(body.error).not.toContain(SECRET)
+    expect(body.error).toContain('连接上游失败')
+  })
+
+  it('非 2xx 分支也会脱敏自定义请求头里的值', async () => {
+    const ctx = await seeded()
+    const headerSecret = 'header-secret-value-123'
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(`invalid auth ${headerSecret}`, { status: 401 })))
+    const response = await call('/api/upstream-models', 'POST', {
+      ctx,
+      body: {
+        provider: {
+          id: 'p',
+          protocol: 'openai',
+          base_url: 'https://api.test/v1',
+          enabled: true,
+          headers: { 'x-custom-auth': headerSecret },
+        },
+      },
+    })
+    expect(response.status).toBe(502)
+    const body = (await response.json()) as { error: string }
+    expect(body.error).not.toContain(headerSecret)
+  })
+})

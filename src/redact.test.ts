@@ -55,3 +55,52 @@ describe('looksLikeSecret', () => {
     expect(looksLikeSecret('short')).toBe(false)
   })
 })
+
+/**
+ * P2-11 回归：凭据前缀覆盖不足。
+ *
+ * 旧实现只有 sk-/hf_/gh?/xox?/AIza/AKIA 与「32 位 hex.后缀」几条，其它主流供应商的
+ * 前缀（Groq 的 gsk_、Cerebras 的 csk-、Perplexity 的 pplx-、xAI 的 xai-、
+ * NVIDIA 的 nvapi-、Stripe 的 sk_live_、Tavily 的 tvly-、Firecrawl 的 fc-）以及
+ * **裸的 32 位十六进制 key**全都不命中，上游一回显就原样进日志。
+ */
+describe('redact 覆盖更多凭据形态（P2-11）', () => {
+  const cases: Array<[string, string]> = [
+    ['Groq', 'gsk_abcdefghijklmnopqrstuvwxyz123456'],
+    ['Cerebras', 'csk-abcdefghijklmnopqrstuvwxyz'],
+    ['Perplexity', 'pplx-abcdefghijklmnopqrstuvwxyz'],
+    ['xAI', 'xai-abcdefghijklmnopqrstuvwxyz123'],
+    ['NVIDIA', 'nvapi-abcdefghijklmnopqrstuvwxyz'],
+    ['Stripe live', 'sk_live_abcdefghijklmnopqrstu'],
+    ['Tavily', 'tvly-abcdefghijklmnopqrstuvwxyz'],
+    ['Firecrawl', 'fc-0123456789abcdef0123456789abcdef'],
+    ['裸 32 位 hex（智谱等）', '0123456789abcdef0123456789abcdef'],
+  ]
+
+  for (const [name, secret] of cases) {
+    it(`${name} 的 key 会被脱敏`, () => {
+      const out = redact(`upstream rejected ${secret} (invalid)`)
+      expect(out).not.toContain(secret)
+      expect(out).toContain('***')
+    })
+  }
+
+  it('上下文模式覆盖 x-goog-api-key 与自定义 auth 头', () => {
+    expect(redact('x-goog-api-key: AIzaSyABCDEFGHIJKLMNOPQRSTUV')).toBe('x-goog-api-key: ***')
+    expect(redact('x-hf-token: hf_abcdefghijklmnop')).toBe('x-hf-token: ***')
+    expect(redact('X-Custom-Auth: custom-secret-value')).toBe('X-Custom-Auth: ***')
+    expect(redact('api-key: 1234567890abcdef')).toBe('api-key: ***')
+  })
+
+  it('URL 查询串里的 key 也会脱敏（自建网关常见）', () => {
+    const out = redact('GET https://gw.test/v1/models?key=abcdef1234567890 failed')
+    expect(out).not.toContain('abcdef1234567890')
+    expect(out).toContain('key=***')
+  })
+
+  it('不误伤普通长文本与短十六进制片段', () => {
+    expect(redact('the quick brown fox jumps over the lazy dog')).toBe('the quick brown fox jumps over the lazy dog')
+    // 16 位 hex（UUID 片段）不该被当成 key
+    expect(redact('id 0123456789abcdef ok')).toBe('id 0123456789abcdef ok')
+  })
+})

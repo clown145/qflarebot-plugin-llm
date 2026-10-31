@@ -1,4 +1,5 @@
 import { createMockContext } from '@qqbot/sdk/testing'
+import type { PluginContext } from '@qqbot/sdk'
 import { describe, expect, it } from 'vitest'
 import plugin from './index.js'
 import { LLM } from './service.js'
@@ -27,16 +28,30 @@ describe('插件定义', () => {
     const service = plugin.services!.llm!(ctx)
     expect(service).toBeInstanceOf(LLM)
   })
+
+  it('清单里不声明 depends（自己提供的服务不能声明成依赖）', () => {
+    // `depends: { llm: '*' }` 会让全新安装在依赖检查阶段被判成 dependencies_missing（400），
+    // 这是修复 `/llm` 命令时最容易走错的那条路。这里锁住 manifest 的形状。
+    expect(plugin.depends).toBeUndefined()
+  })
 })
 
 /**
  * `/llm` 命令：查看与切换默认模型。
  *
- * 对标 AstrBot 的 `/provider`。这里是**接线测试** —— 纯逻辑在
- * `commands/switch.test.ts` 里测过了，这一层验证「命令真的取到了服务、
- * 真的写进了配置、真的会回复用户」。
+ * ## 这组测试为什么必须让 `ctx.service()` 抛错
  *
- * 这类测试在本项目里是必须的：单测能证明函数对，证明不了它被调用。
+ * 命令曾经写成 `ctx.service<LLM>('llm')`。本插件 manifest 里 `depends: {}`，
+ * 而框架的 `ctx.service()` 对**没在 depends 里声明的服务是硬拒绝**：
+ *
+ * ```
+ * 插件 llm 没有在 depends 中声明服务 llm
+ * ```
+ *
+ * 于是 `/llm` 在真实运行时 100% 不可用。旧测试用 `createMockContext(plugin, { services })`
+ * 手工把服务注入进去，恰好绕过了那道门禁——365 个测试全绿，命令一次都跑不通。
+ *
+ * 所以这里**故意让 `service()` 抛错**：命令只要还依赖它，测试立刻失败。
  */
 describe('/llm 命令', () => {
   /** 命令定义可能是函数或对象，统一取出 handler */
@@ -46,9 +61,8 @@ describe('/llm 命令', () => {
     return spec.handler
   }
 
-  /** 造一个带两个模型的上下文，返回命令 handler 和 KV 写入计数 */
-  function setup(config?: Partial<StoredConfig>) {
-    const stored: StoredConfig = {
+  function sampleConfig(overrides: Partial<StoredConfig> = {}): StoredConfig {
+    return {
       ...createDefaultConfig(),
       providers: [
         { id: 'openai-a', name: 'A', protocol: 'openai', base_url: 'https://x', enabled: true },
@@ -59,11 +73,23 @@ describe('/llm 命令', () => {
         { alias: 'fast', provider: 'anthropic-a', model: 'claude-haiku', enabled: true },
       ],
       default_model: 'chat',
-      ...config,
+      ...overrides,
     }
+  }
 
+  /**
+   * 造一个「像真实运行时一样」的上下文：
+   * - KV 里放着配置；
+   * - `service()` 抛框架的原话，任何代码路径走它都会炸。
+   */
+  function setup(overrides: Partial<StoredConfig> = {}): {
+    ctx: PluginContext<unknown>
+    run: (argText: string) => Promise<string>
+    writes: () => number
+    kv: { get: (key?: string) => Promise<string | null> }
+  } {
+    const stored = sampleConfig(overrides)
     let writes = 0
-    // ctx.kv 是只读属性，用 Object.assign 替换整块存储
     const kv = {
       async get() {
         return JSON.stringify(stored)
@@ -82,20 +108,25 @@ describe('/llm 命令', () => {
         return new Map()
       },
     }
-    // 先把 kv 装好，再用同一个 ctx 造服务，最后把服务注入命令用的 ctx
-    const seed = createMockContext(plugin)
-    Object.assign(seed, { kv })
-    const ctx = createMockContext(plugin, { services: { llm: plugin.services!.llm!(seed) } })
+    const base = createMockContext(plugin)
+    const ctx = {
+      ...base,
+      kv: { ...base.kv, ...kv },
+      // 框架的真实行为：没在 depends 声明就抛错
+      service<T>(): T {
+        throw new Error('插件 llm 没有在 depends 中声明服务 llm')
+      },
+    } as unknown as PluginContext<unknown>
     const handler = commandHandler()
-
     return {
+      ctx,
       run: (argText: string) => handler({ ctx, argText }),
       writes: () => writes,
-      stored,
+      kv,
     }
   }
 
-  it('不带参数时列出模型并标出当前使用的', async () => {
+  it('ctx.service() 会抛错，命令仍然能列出模型（P0 回归）', async () => {
     const { run } = setup()
     const out = await run('')
     expect(out).toContain('chat')
@@ -142,27 +173,19 @@ describe('/llm 命令', () => {
   })
 
   it('配置损坏时给出可操作的错误（不是抛异常）', async () => {
-    const seed = createMockContext(plugin)
-    Object.assign(seed, {
+    const base = createMockContext(plugin)
+    const ctx = {
+      ...base,
       kv: {
+        ...base.kv,
         async get() {
           return 'not json'
         },
-        async getJSON() {
-          return null
-        },
-        async put() {
-          return undefined
-        },
-        async delete() {
-          return undefined
-        },
-        async list() {
-          return new Map()
-        },
       },
-    })
-    const ctx = createMockContext(plugin, { services: { llm: plugin.services!.llm!(seed) } })
+      service<T>(): T {
+        throw new Error('插件 llm 没有在 depends 中声明服务 llm')
+      },
+    } as unknown as PluginContext<unknown>
 
     const out = await commandHandler()({ ctx, argText: '' })
     expect(out).toContain('操作失败')

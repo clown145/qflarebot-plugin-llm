@@ -3,7 +3,7 @@ import type { ApiError, ConfigGetResponse, ConfigPutResponse, MetaResponse, Mode
 import { hasErrors, LIMITS, mergeSecrets, normalizeProvider, toPublicConfig, validateConfig, checkBaseUrl, droppedSecrets } from './config/index.js'
 import type { ConfigIssue, PublicConfigInput, StoredConfig } from './config/types.js'
 import { LLMError, errorMessage } from './errors.js'
-import { createAbortHandle, HttpError, json, readJson, readJsonLimited, readTextLimited, redact, truncate } from './http.js'
+import { createAbortHandle, HttpError, json, readJson, readJsonLimited, readTextLimited, safeDetail, urlSecrets } from './http.js'
 import { isRecord } from './json.js'
 import { adapterFor, protocolMeta } from './protocols/registry.js'
 import { LLM } from './service.js'
@@ -270,23 +270,30 @@ export function createRoutes(): Route[] {
         const adapter = adapterFor(provider.protocol)
         const built = adapter.buildListModels(provider)
         const handleAbort = createAbortHandle(15000, request.signal)
+        // 失败分支统一走这一组脱敏材料：api_key、自定义头里的值、base_url 查询串/片段。
+        // 过去连接失败分支只做 truncate，`?key=…` 形式的密钥原样回给页面（实测泄漏）。
+        const secretValues = [
+          provider.api_key,
+          ...Object.values(provider.headers ?? {}),
+          ...urlSecrets(provider.base_url),
+        ]
         try {
           let response: Response
           try {
             response = await fetch(built.url, { ...built.init, signal: handleAbort.signal, redirect: 'manual' })
           } catch (err) {
             if (handleAbort.timedOut()) throw new HttpError(504, '拉取模型超时（15 秒）')
-            throw new HttpError(502, `连接上游失败：${truncate(errorMessage(err), 200)}`)
+            throw new HttpError(502, `连接上游失败：${safeDetail(errorMessage(err), secretValues, 200)}`)
           }
           if (!response.ok) {
             const text = await readTextLimited(response, 4096).catch(() => '')
-            throw new HttpError(502, `拉取模型失败（HTTP ${response.status}）${text ? `：${truncate(redact(text, provider.api_key), 200)}` : ''}`)
+            throw new HttpError(502, `拉取模型失败（HTTP ${response.status}）${text ? `：${safeDetail(text, secretValues, 200)}` : ''}`)
           }
           let jsonBody: unknown
           try {
             jsonBody = await readJsonLimited(response, LIMITS.models_response_max_bytes)
           } catch (err) {
-            throw new HttpError(502, `解析模型列表失败：${truncate(errorMessage(err), 200)}`)
+            throw new HttpError(502, `解析模型列表失败：${safeDetail(errorMessage(err), secretValues, 200)}`)
           }
           const data: ModelsResponse = { ok: true, models: adapter.parseListModels(jsonBody) }
           return json(data)

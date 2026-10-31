@@ -5,7 +5,7 @@ import { asArray, asNumber, asString, isRecord } from '../json.js'
 import { readSSE } from '../sse.js'
 import { streamError, type UpstreamContext } from '../upstream.js'
 import * as thinking from './thinking.js'
-import type { BuiltRequest, ParsedResponse, ParsedStreamEvent, ProtocolAdapter, StreamContext, Target } from './types.js'
+import type { BuildHooks, BuiltRequest, ParsedResponse, ParsedStreamEvent, ProtocolAdapter, StreamContext, Target } from './types.js'
 import { endpointUrl, mergeUsage, toParts, textOf } from './shared.js'
 
 /**
@@ -39,7 +39,9 @@ interface GeminiContent {
   parts: GeminiPart[]
 }
 
-/** JSON Schema → Gemini 受限子集。参考 AstrBot 的转换行为，实现独立编写。 */
+/**
+ * JSON Schema → Gemini 受限子集。参考 AstrBot 的转换行为，实现独立编写。
+ */
 function convertSchema(schema: Record<string, unknown>): Record<string, unknown> {
   const SUPPORTED_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object', 'null'])
   const out: Record<string, unknown> = {}
@@ -55,8 +57,21 @@ function convertSchema(schema: Record<string, unknown>): Record<string, unknown>
   }
   if (typeof type === 'string' && SUPPORTED_TYPES.has(type)) {
     out['type'] = type
+  } else if (isRecord(schema['properties'])) {
+    // **未声明 type 但有 properties：按 object 推断。**
+    //
+    // 旧实现一律写 `type: 'null'`：上游收到 `{type:'null', properties:{…}}`，
+    // 参数校验会把所有字段都当成「不允许有值」，模型永远填不出合法参数。
+    // 这是 JSON Schema 里最常见的省略写法（`type` 可省，靠其它关键字推断）。
+    out['type'] = 'object'
+  } else if (schema['items'] !== undefined || schema['enum'] !== undefined) {
+    // 只有 items / enum、没有 type：按 JSON Schema 惯例推成 string / array
+    if (schema['items'] !== undefined) out['type'] = 'array'
+    else out['type'] = 'string'
   } else {
-    out['type'] = 'null'
+    // 真的什么都没有（或声明了我们不认识的自定义类型）：
+    // 宁可声明成 string（最宽松的标量），也不要用 'null' —— 它会让参数永远缺失。
+    out['type'] = 'string'
   }
 
   for (const key of ['title', 'description', 'enum', 'minimum', 'maximum', 'maxItems', 'minItems', 'nullable', 'required'] as const) {
@@ -211,14 +226,18 @@ function mapMessages(messages: ChatMessage[]): { system: string; contents: Gemin
     // 契约里的 tool 消息只带 tool_call_id，所以要从历史里的 assistant.tool_calls 反查。
     // 反查不到时退回 id（至少不会拼出空字段，上游会给出可读的报错）。
     const name = toolCallNames.get(message.tool_call_id) ?? message.tool_call_id
+    // **tool 消息的 content 可能是内容片段数组**（契约允许 `MessageContent`），
+    // 而旧实现只认字符串：数组走到 `[]` 分支，functionResponse 的 response 变成 `{}`，
+    // 模型拿到的工具结果是空的——不报错，只是「答非所问」。
+    // 这里统一用 textOf() 取纯文本，再按 JSON 解析；非文本片段在 functionResponse 里没有表达。
+    const toolText = textOf(message.content)
     let response: Record<string, unknown> = {}
-    if (typeof message.content === 'string' && message.content.trim()) {
+    if (toolText.trim()) {
       try {
-        const parsed = JSON.parse(message.content) as unknown
-        if (isRecord(parsed)) response = parsed
-        else response = { result: message.content }
+        const parsed = JSON.parse(toolText) as unknown
+        response = isRecord(parsed) ? parsed : { result: toolText }
       } catch {
-        response = { result: message.content }
+        response = { result: toolText }
       }
     }
     push('user', [{ functionResponse: { name, response, id: message.tool_call_id } }])
@@ -260,7 +279,7 @@ function applyHeaders(headers: Record<string, string>, custom: Record<string, st
 
 const GEMINI_MANAGED_HEADERS = new Set(['authorization', 'proxy-authorization', 'x-api-key', 'api-key', 'x-goog-api-key', 'host', 'content-length', 'content-type'])
 
-function buildChat(target: Target, request: ChatRequest, stream: boolean): BuiltRequest {
+function buildChat(target: Target, request: ChatRequest, stream: boolean, hooks: BuildHooks = {}): BuiltRequest {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     accept: stream ? 'text/event-stream' : 'application/json',
@@ -269,12 +288,51 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
   if (target.provider.api_key) headers['x-goog-api-key'] = target.provider.api_key
 
   const mapped = mapMessages(request.messages)
-  const maxTokens = request.max_tokens ?? target.model.max_output_tokens ?? DEFAULT_MAX_TOKENS
+  const requestedMaxTokens = request.max_tokens ?? target.model.max_output_tokens ?? DEFAULT_MAX_TOKENS
   const extra = request.extra_body ?? {}
   // 思考等级：Gemini 按模型世代二选一（2.5 用 thinkingBudget / 3.x 用 thinkingLevel）。
   const effort = thinking.effectiveEffort(request, target.model)
-  const thinkingConfig = thinking.geminiThinkingConfig(effort, target.model.model)
   const extraGeneration = isRecord(extra['generationConfig']) ? extra['generationConfig'] : {}
+  const extraThinking = isRecord(extraGeneration['thinkingConfig']) ? extraGeneration['thinkingConfig'] : undefined
+  // **`thinkingBudget` 与 `maxOutputTokens` 互相约束**：上游要求
+  // `maxOutputTokens > thinkingBudget`，否则直接
+  //   `400 INVALID_ARGUMENT: maxOutputTokens must be greater than thinkingBudget`
+  // 旧实现各算各的（ping 的 max_tokens:16 + 配置的 high → 8192 必坏）。
+  const plan = thinking.planGeminiOutput({
+    effort,
+    model: target.model.model,
+    requestedMaxTokens,
+    outputCap: target.model.max_output_tokens,
+  })
+  // 调用方自己通过 extra_body 传了 thinkingConfig 时以它为准，但要保证
+  // `maxOutputTokens` 跟它自洽（预算能塞进模型输出上限里）；塞不进就放弃它并告警。
+  let callerThinking = extraThinking
+  /** 调用方的 thinkingConfig 被判定不可用时置 true：合并后要从 generationConfig 里删掉 */
+  let droppedCallerThinking = false
+  let maxOutputTokens = plan.maxTokens
+  if (callerThinking) {
+    const customBudget = asNumber(callerThinking['thinkingBudget'])
+    if (customBudget !== undefined && customBudget > 0) {
+      const fitted = thinking.maxTokensForBudget({
+        requestedMaxTokens,
+        budget: customBudget,
+        outputCap: target.model.max_output_tokens,
+        // Gemini 只要严格大于预算；留 1 token 余量即可，不必像 Anthropic 那样留 1024
+        reserve: 1,
+      })
+      if (fitted.fits) {
+        maxOutputTokens = fitted.maxTokens
+      } else {
+        hooks.warn?.('调用方指定的 thinkingBudget 超过模型输出上限，本次不发送 thinkingConfig', {
+          thinkingBudget: customBudget,
+          maxOutputTokens: fitted.maxTokens,
+          model: target.model.model,
+        })
+        callerThinking = undefined
+        droppedCallerThinking = true
+      }
+    }
+  }
   const body: Record<string, unknown> = {
     ...extra,
     // 不写 `model`：模型名已经在 URL 路径里（`/models/{model}:generateContent`），
@@ -289,17 +347,23 @@ function buildChat(target: Target, request: ChatRequest, stream: boolean): Built
     // 是这层自己的，仍按「extra_body 优先、随后被权威值覆盖」处理。
     generationConfig: {
       ...extraGeneration,
-      maxOutputTokens: maxTokens,
+      maxOutputTokens,
       ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
       ...(request.top_p !== undefined ? { topP: request.top_p } : {}),
       ...(request.stop !== undefined
         ? { stopSequences: Array.isArray(request.stop) ? request.stop : [request.stop] }
         : {}),
       // 同理，`thinkingConfig` 也要按字段合并：调用方可能只想改 `includeThoughts`
-      ...(isRecord(extraGeneration['thinkingConfig']) ? { thinkingConfig: extraGeneration['thinkingConfig'] } : {}),
-      ...(thinkingConfig && !isRecord(extraGeneration['thinkingConfig']) ? { thinkingConfig } : {}),
+      ...(callerThinking
+        ? { thinkingConfig: callerThinking }
+        : plan.thinkingConfig
+          ? { thinkingConfig: plan.thinkingConfig }
+          : {}),
     },
   }
+  // `extraGeneration` 的浅展开已经把调用方原始的 thinkingConfig 带进来了；
+  // 汇总判定它不可用时，必须显式删掉（否则又会被发出去）
+  if (droppedCallerThinking) delete (body['generationConfig'] as Record<string, unknown>)['thinkingConfig']
   if (mapped.system) body['systemInstruction'] = { parts: [{ text: mapped.system }] }
   if (request.json) {
     // Gemini 的 JSON 模式：response_mime_type + 宽松 schema
@@ -361,7 +425,12 @@ function parseResponse(json: unknown): ParsedResponse {
   let reasoning = ''
   const signatures: ThoughtSignature[] = []
   const toolCalls: ToolCall[] = []
-  // 回传时 parts 重建顺序是「先文本 part、后 functionCall part」，签名里的 part_index 按这个口径记
+  // 回传时 parts 重建顺序是「先文本 part、后 functionCall part」，签名里的 part_index 按这个口径记。
+  //
+  // **只数「会出现在重建 parts 里的文本 part」**：thought part 的文本不回传
+  // （`ChatResult.reasoning` 是独立字段，调用方回传时只放 `text`），所以它不占下标。
+  // 流式路径曾经对 thought part 也自增，导致同一条响应在流式/非流式下算出的
+  // part_index 差 1（见 parseStream 的同名计数）。
   let textPartIndex = 0
   parts.forEach((raw, index) => {
     if (!isRecord(raw)) return
@@ -370,10 +439,7 @@ function parseResponse(json: unknown): ParsedResponse {
     const signature = asString(raw['thoughtSignature']) || asString(raw['thought_signature'])
     if (partText && thought) {
       // thought part 的文本不回传，但签名仍要保留（回传时贴在重建的文本 part 上）
-      if (signature) {
-        signatures.push({ part_index: textPartIndex, part_kind: 'text', signature })
-        textPartIndex += 1
-      }
+      if (signature) signatures.push({ part_index: textPartIndex, part_kind: 'text', signature })
       reasoning += partText
       return
     }
@@ -488,7 +554,9 @@ async function* parseStream(
   // 工具槽位在整条流内连续递增：Gemini 一次响应里 parts 可能分多帧下发，
   // 每帧重置会让多个工具调用塌缩到 index 0
   let toolIndex = 0
-  // 文本 part 计数：签名里的 part_index 按「重建顺序」记（先文本、后 functionCall）
+  // 文本 part 计数：签名里的 part_index 按「重建顺序」记（先文本、后 functionCall）。
+  // **只数会出现在重建 parts 里的文本 part**（thought part 的文本不回传），
+  // 口径必须与非流式 parseResponse 完全一致，否则同一条响应在两条路径下签名落点不同。
   let textPartIndex = 0
   for await (const message of readSSE(body)) {
     if (!message.data.trim()) continue
@@ -524,7 +592,7 @@ async function* parseStream(
           if (signature) {
             yield { type: 'thought_signature', part_index: textPartIndex, part_kind: 'text', signature }
           }
-          textPartIndex += 1
+          if (!thought) textPartIndex += 1
           yield { type: thought ? 'reasoning_delta' : 'text_delta', text }
           continue
         }
@@ -631,10 +699,9 @@ function buildListModels(provider: ProviderConfig): BuiltRequest {
   const base = provider.base_url.replace(/\/+$/, '')
   // Gemini 的模型列表在 /models（v1beta），带 generateContent 端点时退回上一级
   let path = base
-  for (const mark of ['?te', '#']) {
-    const at = path.search(/[?#]/)
-    if (at >= 0) path = path.slice(0, at)
-  }
+  // 查询串/片段不属于路径，先切掉（旧实现把 `?` 写成了 `?te`，等于从不处理 `?`）
+  const splitAt = path.search(/[?#]/)
+  if (splitAt >= 0) path = path.slice(0, splitAt)
   if (path.endsWith(':generateContent') || path.endsWith(':streamGenerateContent')) {
     path = path.slice(0, path.lastIndexOf(':'))
   }

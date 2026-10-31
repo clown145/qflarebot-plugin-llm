@@ -25,7 +25,7 @@
  * 宁可退化成上游默认值，也不要让用户的对话直接失败。
  */
 
-import type { ModelConfig, ProviderConfig, ReasoningEffort } from '../config/types.js'
+import type { ModelConfig, ReasoningEffort } from '../config/types.js'
 
 /**
  * Anthropic 的 `budget_tokens` 下限，来自官方文档的硬性约束。
@@ -33,6 +33,23 @@ import type { ModelConfig, ProviderConfig, ReasoningEffort } from '../config/typ
  * 小于它会直接 `400 thinking.budget_tokens: Input should be greater than or equal to 1024`。
  */
 const ANTHROPIC_MIN_BUDGET = 1024
+
+/**
+ * 思考预算占用多少输出配额、要预留多少给正文。
+ *
+ * 用于装配层（`protocols/*.ts` 的 buildChat）在决定 `max_tokens` 时同时满足两条硬约束：
+ *
+ * - **Anthropic**：thinking 与正文**共享** `max_tokens`，要求 `budget_tokens < max_tokens`，
+ *   而且贴着上限会把正文挤成 0 —— 所以 `max_tokens` 至少是 `预算 + 余量`。
+ * - **Gemini 2.5**：实际思考 token 计入 `thoughtsTokenCount`（由输出预算承担），
+ *   `maxOutputTokens` 小于 `thinkingBudget` 时上游直接
+ *   `400 INVALID_ARGUMENT: maxOutputTokens must be greater than thinkingBudget`。
+ * - OpenAI 的 `reasoning_effort`、Gemini 3.x 的 `thinkingLevel` 没有显式预算，不用预留。
+ *
+ * 装配层还要考虑模型的 `max_output_tokens` 硬上限：预算 + 余量顶到上限时，
+ * 宁可把预算压回上限以内，也不能发出一个超过模型上限的 `max_tokens`（同样 400）。
+ */
+export const OUTPUT_RESERVE = 1024
 
 /**
  * 等级 → Anthropic 思考预算（tokens）。
@@ -60,6 +77,9 @@ const ANTHROPIC_BUDGET: Record<ReasoningEffort, number | null> = {
  * - 正数 = 预算上限
  *
  * 所以 `minimal` 在这里能真正表达成「关掉」，比 Anthropic 那条路更贴合语义。
+ *
+ * **例外：2.5 Pro 不接受 0**。它只收 `128–32768` 或 `-1`，发 0 直接
+ * `400 INVALID_ARGUMENT`；`minimal` 在 Pro 上退化成最小正预算 128。
  */
 const GEMINI_BUDGET: Record<ReasoningEffort, number> = {
   minimal: 0,
@@ -67,6 +87,9 @@ const GEMINI_BUDGET: Record<ReasoningEffort, number> = {
   medium: 4096,
   high: 8192,
 }
+
+/** 2.5 Pro 允许的最小正预算；0（关闭思考）在 Pro 上不合法 */
+const GEMINI_PRO_MIN_BUDGET = 128
 
 /** 等级 → Gemini 3.x 的 `thinkingLevel`（枚举，全大写） */
 const GEMINI_LEVEL: Record<ReasoningEffort, string> = {
@@ -88,6 +111,17 @@ const GEMINI_LEVEL: Record<ReasoningEffort, string> = {
 function isGemini3(model: string): boolean {
   const name = model.toLowerCase()
   return name.includes('gemini-3-') || name.includes('gemini-3.')
+}
+
+/**
+ * 是不是 Gemini 2.5 Pro（含 `2.5-pro-preview` 之类变体）。
+ *
+ * Pro 与 Flash 对 `thinkingBudget: 0` 的接受度不同：Flash 允许 0（关闭思考），
+ * Pro 只收 `128–32768` 或 `-1`，发 0 直接 400。
+ */
+function isGemini25Pro(model: string): boolean {
+  const name = model.toLowerCase()
+  return name.includes('gemini-2.5-pro') || (name.includes('gemini-2.5') && name.includes('pro'))
 }
 
 /**
@@ -117,29 +151,6 @@ export function openAIReasoningEffort(effort: ReasoningEffort | undefined): stri
   return effort
 }
 
-/**
- * 给 Anthropic 生成 `thinking` 字段。
- *
- * 两种形态：
- * - `minimal` → `undefined`（不发字段 = 保持默认；显式关闭思考要发 `{type:'disabled'}`，
- *   但那个值并非所有版本都接受，不发更安全）
- * - 其余等级 → `{ type: 'enabled', budget_tokens: N }`
- *
- * ## 与 max_tokens 的关系（调用方必须处理）
- *
- * Anthropic 要求 `budget_tokens < max_tokens`。这个约束在 `service.ts` 里统一兜底：
- * 开了思考时会把 `max_tokens` 抬到 `budget + 余量`。这里只负责产出 thinking 字段本身，
- * 不修改 max_tokens——那是请求装配层的职责，放在这里会让这个函数有副作用。
- */
-export function anthropicThinking(
-  effort: ReasoningEffort | undefined,
-): { type: 'enabled'; budget_tokens: number } | undefined {
-  if (!effort) return undefined
-  const budget = ANTHROPIC_BUDGET[effort]
-  if (budget === null) return undefined
-  return { type: 'enabled', budget_tokens: budget }
-}
-
 /** Anthropic 某等级对应的预算；`undefined` / `minimal` 时为 0，供装配层判断要不要抬 max_tokens */
 export function anthropicBudgetOf(effort: ReasoningEffort | undefined): number {
   if (!effort) return 0
@@ -150,7 +161,7 @@ export function anthropicBudgetOf(effort: ReasoningEffort | undefined): number {
  * 给 Gemini 生成 `generationConfig.thinkingConfig`。
  *
  * 按模型世代二选一，**不能两个都发**：
- * - 2.5 系列 → `{ thinkingBudget: N }`（`minimal` 是 0 = 关闭思考）
+ * - 2.5 系列 → `{ thinkingBudget: N }`（`minimal` 是 0 = 关闭思考；2.5 Pro 上退化成 128）
  * - 3.x 系列 → `{ thinkingLevel: 'HIGH' }`
  *
  * 返回的对象由调用方合进 `generationConfig`。
@@ -163,19 +174,144 @@ export function geminiThinkingConfig(
   if (isGemini3(model)) {
     return { thinkingLevel: GEMINI_LEVEL[effort] }
   }
-  return { thinkingBudget: GEMINI_BUDGET[effort] }
+  const budget = GEMINI_BUDGET[effort]
+  // 2.5 Pro 只收 128–32768 或 -1；0 会直接 400 INVALID_ARGUMENT。
+  // 语义上「很浅」仍然是想得尽可能少 → 用允许的最小正预算，而不是硬塞一个非法值。
+  if (budget === 0 && isGemini25Pro(model)) {
+    return { thinkingBudget: GEMINI_PRO_MIN_BUDGET }
+  }
+  return { thinkingBudget: budget }
 }
 
 /**
- * 某个模型的思考等级是否会让正文预算被挤占。
+ * 装配层（各适配器的 buildChat）最终采用的输出上限与思考开关。
  *
- * 用于 `service.ts` 在装配请求时决定要不要抬高 `max_tokens`。
- * 只有 Anthropic 有这个约束（thinking 与正文共享 `max_tokens`）；
- * OpenAI 的 `reasoning_effort` 和 Gemini 的 budget 都是独立配额。
+ * `thinking` 为 undefined 表示这一轮**不发思考**（没配等级、协议没有对应形状、
+ * 或者模型的输出上限根本放不下思考预算）；其它情况是**最终要发出去的字段值**。
  */
-export function needsHeadroomForThinking(protocol: ProviderConfig['protocol'], effort: ReasoningEffort | undefined): number {
-  if (protocol !== 'anthropic') return 0
-  return anthropicBudgetOf(effort)
+export interface AnthropicOutputPlan {
+  /** 最终写进请求的 `max_tokens` */
+  maxTokens: number
+  /** 最终写进 `thinking` 的对象；undefined = 不发 thinking 字段 */
+  thinking?: { type: 'enabled'; budget_tokens: number }
 }
 
-export { isGemini3, ANTHROPIC_MIN_BUDGET }
+export interface GeminiOutputPlan {
+  /** 最终写进请求的 `generationConfig.maxOutputTokens` */
+  maxTokens: number
+  /**
+   * 最终写进 `generationConfig.thinkingConfig` 的对象；undefined = 不发。
+   * 注意 `{ thinkingBudget: 0 }` 是**合法值**（2.5 系列关闭思考），与「不发」不是一回事。
+   */
+  thinkingConfig?: Record<string, unknown>
+}
+
+/**
+ * 算 Anthropic 的 `max_tokens` + `thinking`，同时满足全部硬约束：
+ *
+ * - `budget_tokens` ≥ 1024；
+ * - `budget_tokens` **严格小于** `max_tokens`（否则 400）；
+ * - 思考与正文共享同一个输出预算，贴着上限会把正文挤成 0 → 至少 `预算 + 余量`；
+ * - 不超过模型自己的 `max_output_tokens`（超过同样 400）。
+ *
+ * 所以不能简单地「把输出上限抬到预算的两倍」——预算 8192 时那是 16384，
+ * 直接撞上 `claude-3-5-sonnet`（8192）这类模型的上限。放不下时**直接不发思考**：
+ * 少想一次只是体验降级，发一个必 400 的组合会让整轮对话不可用。
+ */
+export function planAnthropicOutput(options: {
+  effort: ReasoningEffort | undefined
+  requestedMaxTokens: number
+  /** 模型配置里的输出上限（`max_output_tokens`），未知时 undefined */
+  outputCap?: number | undefined
+}): AnthropicOutputPlan {
+  const requested = normalizeTokens(options.requestedMaxTokens)
+  const budget = anthropicBudgetOf(options.effort)
+  // minimal / 未配置：不发 thinking（minimal 在 Anthropic 上没有合法表达）
+  if (budget <= 0) return { maxTokens: requested }
+  const fitted = fitBudget(requested, budget, ANTHROPIC_MIN_BUDGET, options.outputCap)
+  return fitted.budget === undefined
+    ? { maxTokens: fitted.maxTokens }
+    : { maxTokens: fitted.maxTokens, thinking: { type: 'enabled', budget_tokens: fitted.budget } }
+}
+
+/**
+ * 算 Gemini 的 `maxOutputTokens` + `thinkingConfig`。
+ *
+ * 上游要求 `maxOutputTokens > thinkingBudget`（否则
+ * `400 INVALID_ARGUMENT: maxOutputTokens must be greater than thinkingBudget`），
+ * 而旧实现各算各的：`ping()` 用 `max_tokens: 16`、模型配了 `high` 就发 8192，必坏。
+ *
+ * `thinkingLevel`（3.x）没有显式预算、也不受 `maxOutputTokens` 约束，原样发。
+ */
+export function planGeminiOutput(options: {
+  effort: ReasoningEffort | undefined
+  model: string
+  requestedMaxTokens: number
+  outputCap?: number | undefined
+}): GeminiOutputPlan {
+  const requested = normalizeTokens(options.requestedMaxTokens)
+  const config = geminiThinkingConfig(options.effort, options.model)
+  if (!config) return { maxTokens: requested }
+  const raw = config['thinkingBudget']
+  // 3.x 的 thinkingLevel：没有可预留的预算
+  if (typeof raw !== 'number') return { maxTokens: requested, thinkingConfig: config }
+  // 0 = 明确关闭思考（2.5 Flash 系列合法）：不需要给正文留额外余地，原样发
+  if (raw <= 0) return { maxTokens: requested, thinkingConfig: config }
+  const fitted = fitBudget(requested, raw, GEMINI_PRO_MIN_BUDGET, options.outputCap)
+  // 预算被压到 0 或整个放弃：回落到「关闭思考」这个**合法**状态，而不是发一个 400 的组合
+  if (fitted.budget === undefined) return { maxTokens: fitted.maxTokens, thinkingConfig: { thinkingBudget: 0 } }
+  return { maxTokens: fitted.maxTokens, thinkingConfig: { thinkingBudget: fitted.budget } }
+}
+
+function normalizeTokens(value: number): number {
+  return Number.isFinite(value) && value >= 1 ? Math.trunc(value) : 1
+}
+
+/**
+ * 调用方自己用 `extra_body` 指定了思考预算时：把输出上限抬到跟它自洽。
+ *
+ * `extra_body` 是「调用方更具体所以优先」，但优先不等于可以发出一个必 400 的组合：
+ * Anthropic 要求 `budget_tokens < max_tokens`，Gemini 要求 `maxOutputTokens > thinkingBudget`。
+ * 这里只负责算输出上限；`fits === false` 表示**连模型的输出上限都放不下**这个预算，
+ * 适配器据此放弃调用方指定的思考字段（并 warn），而不是发出去等 400。
+ */
+export function maxTokensForBudget(options: {
+  requestedMaxTokens: number
+  budget: number
+  /** 模型配置里的输出上限（`max_output_tokens`），未知时 undefined */
+  outputCap?: number | undefined
+  /** 需要给正文留的余量；Anthropic 共享预算用 1024，Gemini 只要严格大于即可 */
+  reserve?: number
+}): { maxTokens: number; fits: boolean } {
+  const requested = normalizeTokens(options.requestedMaxTokens)
+  const budget = Math.trunc(options.budget)
+  if (!Number.isFinite(budget) || budget <= 0) return { maxTokens: requested, fits: true }
+  const reserve = options.reserve ?? OUTPUT_RESERVE
+  const wanted = Math.max(requested, budget + reserve)
+  const cap = options.outputCap !== undefined && Number.isFinite(options.outputCap) && options.outputCap >= 1
+    ? Math.trunc(options.outputCap)
+    : undefined
+  if (cap === undefined) return { maxTokens: wanted, fits: true }
+  const maxTokens = Math.min(wanted, cap)
+  return { maxTokens, fits: maxTokens > budget }
+}
+
+/**
+ * `plan*Output` 的收尾：抬到「预算 + 余量」，再按模型上限压回。
+ *
+ * 返回的 `budget` 为 undefined 表示「放不下，这一轮不发思考」。
+ */
+function fitBudget(requested: number, budget: number, minBudget: number, outputCap: number | undefined): { maxTokens: number; budget?: number } {
+  const maxTokens = Math.max(requested, budget + OUTPUT_RESERVE)
+  if (outputCap === undefined || !Number.isFinite(outputCap) || outputCap < 1) {
+    return { maxTokens, budget }
+  }
+  const cap = Math.trunc(outputCap)
+  if (maxTokens <= cap) return { maxTokens, budget }
+  const room = cap - OUTPUT_RESERVE
+  // 放不下最小合法预算：这一轮不发思考，至少不要让请求一定 400
+  if (room < minBudget) return { maxTokens: cap }
+  return { maxTokens: cap, budget: Math.min(budget, room) }
+}
+
+export { isGemini3, isGemini25Pro, ANTHROPIC_MIN_BUDGET }

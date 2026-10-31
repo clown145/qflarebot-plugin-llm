@@ -1,7 +1,7 @@
 import { definePlugin } from '@qqbot/sdk'
 import { createRoutes } from './routes.js'
-import { createConfigStore, ensureConfig } from './store.js'
-import { LLM } from './service.js'
+import { ensureConfig } from './store.js'
+import { createLLM } from './service.js'
 import { formatModelList, resolveModelChoice } from './commands/switch.js'
 import type { ModelInfo } from './contract.js'
 
@@ -29,7 +29,7 @@ export default definePlugin({
   ui: { path: '/ui/', title: 'LLM 接口' },
 
   services: {
-    llm: (ctx) => new LLM({ store: createConfigStore(ctx), logger: ctx.logger }),
+    llm: (ctx) => createLLM(ctx),
   },
 
   /**
@@ -60,7 +60,18 @@ export default definePlugin({
       usage: '/llm [use <序号或别名>]',
       aliases: ['llm 模型'],
       async handler({ ctx, argText }) {
-        const service = ctx.service<LLM>('llm')
+        // **不能写成 `ctx.service<LLM>('llm')`。**
+        //
+        // 本插件的 manifest 里 `depends: {}`（也不该把自己提供的服务声明成依赖，
+        // 那会在全新安装时被依赖检查当成 `dependencies_missing` 拒掉）。而框架的
+        // `ctx.service()` 对**没在 depends 里声明的服务是硬拒绝**：
+        //
+        //   插件 llm 没有在 depends 中声明服务 llm
+        //
+        // 结果就是 `/llm` 命令在真实运行时 100% 不可用——单测里手工注入 services
+        // 恰好绕过了这道门禁，所以测试一直是绿的。这里直接构造服务实例，
+        // 与路由层（routes.ts 的 `/api/test`）走同一条路径。
+        const service = createLLM(ctx)
         const arg = argText.trim()
 
         // `/llm use <x>`

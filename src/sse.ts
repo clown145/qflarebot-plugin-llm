@@ -19,10 +19,16 @@ export async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator
       event = undefined
       return null
     }
-    const message: SSEMessage = { data: data.join('\n') }
-    if (event) message.event = event
+    const joined = data.join('\n')
+    const pendingEvent = event
     event = undefined
     data = []
+    // **空的 data 帧是合法的心跳**（`data:` 后直接空行），很多网关/反代定期发它保活。
+    // 派发出去会让适配器 `JSON.parse('')` 抛「上游流式数据不是合法 JSON」，
+    // 整条流直接失败——心跳把正常对话打断。这里不派发，直接丢弃。
+    if (!joined.trim()) return null
+    const message: SSEMessage = { data: joined }
+    if (pendingEvent) message.event = pendingEvent
     return message
   }
 

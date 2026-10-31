@@ -11,7 +11,7 @@ import { timeoutHint, timeoutLimits } from '../limits.js'
 import { catalogProviderFor, loadModelCatalog } from '../modelCatalog.js'
 import { openModelDialog } from '../modelDialog.js'
 import { setPending } from '../pending.js'
-import { aliasBase, isProviderDraftDirty, uniqueProviderId } from '../providerDraft.js'
+import { aliasBase, isProviderDraftDirty, providerFingerprint, uniqueProviderId } from '../providerDraft.js'
 import { pickProviderPreset } from '../providerTemplateDialog.js'
 import { rebaseProviderDraft } from '../rebase.js'
 import { takeDroppedSecrets, updateConfig } from '../save.js'
@@ -167,7 +167,13 @@ function refreshProviderCard(): void {
   updateLocal(service.draft, mounted.providerRefs)
 }
 
-/** 整块重建供应商卡片（切换供应商时用，内容全变了） */
+/**
+ * 整块重建供应商卡片（切换供应商、或草稿被别处的保存整体替换时用，内容全变了）。
+ *
+ * **不要拿它做「保存后刷新」**：保存后卡片上的输入框内容本来就是用户刚填的，
+ * 重建只会丢焦点、丢光标位置。保存后的状态刷新走 `refreshProviderCard()`（局部改节点），
+ * 事件处理器则统一从 `service.draft` 取当前草稿（见 `buildProviderCard` 里的注释）。
+ */
 function rebuildProviderCard(): void {
   const card = mounted.providerCard
   if (!card || !service.draft) return
@@ -232,10 +238,17 @@ onSavedApplied((previous, next) => {
     return
   }
   if (!draftDirty()) {
+    const previousBase = service.base
     service.draft = { ...clone(nextProvider), clear_key: false }
     service.base = clone(service.draft)
     service.baseVersion = state.version
     syncPending()
+    // 草稿被整体换成了新对象：卡片上的输入框还停在旧值（例如别处改了启停/超时）。
+    // **只有已保存值真的变了才重建**——否则每次模型保存都会重建卡片、丢掉输入焦点。
+    // 走到这个分支说明用户没有未保存编辑，重建不会打断正在输入的内容。
+    if (!previousBase || providerFingerprint(previousBase) !== providerFingerprint(service.draft)) {
+      rebuildProviderCard()
+    }
     return
   }
   const before = previous?.providers.find((item) => item.id === service.draft?.id) ?? null
@@ -1105,62 +1118,97 @@ function buildProviderCard(): HTMLElement {
   const refs = { save, dirty: dirtyBadge, keyBadge, clearKey, key, enabledBadge, title, keyBanner }
   // 登记到引用表：保存后 updateLocal 直接改这些节点的文字/禁用态，不重建卡片
   mounted.providerRefs = refs
-  const touch = () => {
+
+  /**
+   * 事件处理器里**每次都要从 `service.draft` 取当前草稿**，不能用 `buildProviderCard()`
+   * 闭包捕获的那个对象。
+   *
+   * 保存成功后 `saveProvider()` 会把 `service.draft` 换成从 `state.config` 重新读出来的
+   * **新对象**，而卡片刻意不重建（不闪、不丢焦点）。旧实现让处理器继续改闭包里那个
+   * 已经废弃的对象，于是：
+   *
+   * - 之后的字段改动落在旧对象上，`draftDirty()` 比较的是新 draft 与 base → 永远 false，
+   *   保存按钮保持 disabled：**保存过一次以后再也保存不了**（实测）；
+   * - 「测试」读的是 `service.draft`（新对象），发出去的还是保存前的旧值。
+   *
+   * 这里统一走 `currentDraft()`；卡片 DOM 不重建，节点身份、焦点、光标都保持。
+   */
+  const currentDraft = (): ProviderDraft | null => service.draft
+  const touch = (): void => {
+    const live = currentDraft()
+    if (!live) return
     syncPending()
-    updateLocal(draft, refs)
+    updateLocal(live, refs)
   }
 
   name.addEventListener('input', () => {
-    draft.name = name.value
+    const live = currentDraft()
+    if (!live) return
+    live.name = name.value
     touch()
   })
   protocol.addEventListener('change', () => {
-    const previous = protocolMeta(draft.protocol)
-    draft.protocol = protocol.value as ProtocolId
-    const next = protocolMeta(draft.protocol)
+    const live = currentDraft()
+    if (!live) return
+    const previous = protocolMeta(live.protocol)
+    live.protocol = protocol.value as ProtocolId
+    const next = protocolMeta(live.protocol)
     baseHint.textContent = next?.base_url_hint ?? ''
     if (!baseUrl.value.trim() || baseUrl.value === previous?.default_base_url) {
       const value = next?.default_base_url ?? ''
-      draft.base_url = value
+      live.base_url = value
       baseUrl.value = value
     }
     clearAvailable()
-    subtitle.textContent = `${draft.id} · ${protocolLabel(draft.protocol)}`
+    subtitle.textContent = `${live.id} · ${protocolLabel(live.protocol)}`
     touch()
   })
   baseUrl.addEventListener('input', () => {
-    draft.base_url = baseUrl.value
+    const live = currentDraft()
+    if (!live) return
+    live.base_url = baseUrl.value
     touch()
   })
   timeout.addEventListener('input', () => {
-    draft.timeout_ms = timeout.value ? Number(timeout.value) : undefined
+    const live = currentDraft()
+    if (!live) return
+    live.timeout_ms = timeout.value ? Number(timeout.value) : undefined
     touch()
   })
   key.addEventListener('input', () => {
-    draft.api_key = key.value
-    if (key.value) draft.clear_key = false
+    const live = currentDraft()
+    if (!live) return
+    live.api_key = key.value
+    if (key.value) live.clear_key = false
     touch()
   })
   clearKey.addEventListener('click', () => {
-    draft.clear_key = !draft.clear_key
-    if (draft.clear_key) {
-      draft.api_key = undefined
+    const live = currentDraft()
+    if (!live) return
+    live.clear_key = !live.clear_key
+    if (live.clear_key) {
+      live.api_key = undefined
       key.value = ''
     }
     touch()
   })
   headers.addEventListener('input', () => {
-    draft.headers = parseHeaders(headers.value)
+    const live = currentDraft()
+    if (!live) return
+    live.headers = parseHeaders(headers.value)
     validateHeaders()
     touch()
   })
   enabled.addEventListener('change', () => {
-    draft.enabled = enabled.checked
+    const live = currentDraft()
+    if (!live) return
+    live.enabled = enabled.checked
     touch()
   })
-
   allowHttp.addEventListener('change', () => {
-    draft.allow_http = allowHttp.checked
+    const live = currentDraft()
+    if (!live) return
+    live.allow_http = allowHttp.checked
     allowHttpHint.style.display = allowHttp.checked ? '' : 'none'
     touch()
   })

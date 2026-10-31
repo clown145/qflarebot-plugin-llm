@@ -6,13 +6,14 @@ QFlareBot 的 LLM 接口插件：提供供应商与模型配置页，并通过 `
 
 ## 功能
 
-- 管理多个 LLM 供应商，支持 OpenAI 兼容接口和 Anthropic Messages。
+- 管理多个 LLM 供应商，支持 OpenAI 兼容接口、Anthropic Messages 与 Google Gemini。
 - 模型别名映射到供应商与上游模型。
 - 模型元数据：上下文窗口、输出上限和图片/音频/工具/推理等能力，可从 models.dev 自动填充，也可手动维护。
 - 提供 `chat`、`stream`、`listModels`、`resolve`、`ping` 接口。
 - 工具定义与工具调用结果透传，由调用方执行工具。
-- 多模态输入：文本、图片（OpenAI 兼容 / Anthropic）、音频（OpenAI 兼容）、文件（Anthropic）。
+- 多模态输入：文本、图片（三个协议）、音频（OpenAI 兼容 / Gemini）、文件（Anthropic / Gemini）。
 - 推理内容透传：DeepSeek `reasoning_content` 与 Anthropic thinking block 通过 `reasoning` / `reasoning_delta` 返回。
+- 思考签名往返：Gemini 的 `thought_signatures`（part 签名）与 Anthropic 的 `reasoning_signatures`（thinking / redacted_thinking block），多轮工具调用必须原样回传，插件负责解析与回填。
 - 思考等级：按模型配置推理深度（很浅/浅/中/深），自动换算成 OpenAI `reasoning_effort`、Anthropic `budget_tokens`、Gemini `thinkingBudget`/`thinkingLevel`。
 - 独立的配置页面，支持供应商/模型增删改、启停、连通性测试、拉取上游模型、导入导出。
 - API Key 仅保存在插件 KV 中，页面不回显；导出文件不包含 Key 和任何可能带密钥的请求头。
@@ -46,6 +47,24 @@ QFlareBot 的 LLM 接口插件：提供供应商与模型配置页，并通过 `
 调用方使用模型别名，不直接依赖供应商或上游模型名。
 
 供应商设置和默认设置需要显式保存（切换供应商或刷新页面前会提示未保存）；模型的添加、编辑、启停、删除和默认模型切换会立即保存。
+
+### 命令
+
+配好供应商与模型后，可以在聊天里用 `/llm` 查看和切换**全局默认模型**：
+
+| 命令 | 说明 |
+| --- | --- |
+| `/llm` | 列出所有可用别名（标出当前默认的那个）与序号 |
+| `/llm use <序号或别名>` | 切换默认模型，写入配置（全局生效，不是按会话） |
+| `/llm 模型` | 同上（中文别名） |
+
+说明：
+
+- 序号来自列表顺序，配置一变就会错位；别名是稳定标识，脚本/习惯用法建议用别名。
+- 切换成功才写 KV（KV 有每日写入额度），已经是当前模型时直接返回提示、不写。
+- 「全局默认」意味着所有会话都会用它。需要按会话切换的调用方，请自己持会话表并用
+  `ChatRequest.model` 每次指定，接口本来就支持。
+- 配置还没建好（没有供应商/模型）时，命令会提示去面板「插件 → LLM 接口」配置。
 
 ### 配置存储
 
@@ -131,10 +150,12 @@ https://[2606:4700::6810:85e5]/v1
 几个要留意的点：
 
 - **只在显式配置时才发送**。没配就完全不带这些字段，对「不认它的兼容网关」零影响。
-- **Anthropic 会自动抬高 `max_tokens`**。它要求 `budget_tokens < max_tokens`，而且思考与正文**共享**输出预算；所以开启思考时 `max_tokens` 至少被抬到预算的两倍（一半想、一半说），否则正文会被截断或直接 400。
+- **Anthropic 会自动抬高 `max_tokens`，但不会超过模型输出上限**。它要求 `budget_tokens < max_tokens`，而且思考与正文**共享**输出预算，所以开启思考时 `max_tokens` 至少是「预算 + 1024」。模型的 `max_output_tokens` 是硬上限（例如 8192）：顶到上限时插件会把预算压到上限以内；真的放不下（连最小合法预算 + 余量都超）就**这一轮不发思考**，不会发一个必定 400 的组合。
 - **Gemini 按模型名二选一**：`gemini-2.5-*` 用 `thinkingBudget`，`gemini-3-*` / `gemini-3.*` 用 `thinkingLevel`。混用会 400。
+- **Gemini 的 `maxOutputTokens` 必须大于 `thinkingBudget`**：插件会把 `maxOutputTokens` 抬到「预算 + 1024」，并按模型的 `max_output_tokens` 压回；压不下就把思考降成关闭（`thinkingBudget: 0`）。
+- **Gemini 2.5 Pro 不接受 `thinkingBudget: 0`**（只收 128–32768 或 -1），所以「很浅」在 Pro 上会发 128；2.5 Flash 系列仍然是 0（关闭思考）。
 - **不是所有模型都支持**。不支持的上游有的静默忽略、有的报错。模型能力里勾了「推理」不代表上游一定认，配之前建议先在「概览」里测一次。
-- 思考内容本身仍然通过 `reasoning` / `reasoning_delta` 返回，且不回传到后续请求（Anthropic 的 thinking 签名无法重建）。
+- 思考内容本身仍然通过 `reasoning` / `reasoning_delta` 返回；Anthropic 的思考 block **回传**走独立的 `reasoning_signatures`（正文与签名必须成对，纯文本装不下签名，见下文「Anthropic 思考签名」）。
 
 ## 服务接口
 
@@ -207,7 +228,11 @@ for await (const event of llm.stream({ model: 'reasoner', messages })) {
 }
 ```
 
-非流式结果里是 `result.reasoning`。推理内容只返回给调用方，不会在后续请求里回传（Anthropic 的 thinking 签名无法重建）。
+非流式结果里是 `result.reasoning`。它只是给人看的纯文本，**不会**被回传给上游。
+
+Anthropic 开启思考后，多轮工具调用必须把上一轮的 thinking block 原样带回去（否则 400），
+而 thinking block 的签名与正文必须成对——纯文本装不下签名，所以另用
+`ChatResult.reasoning_signatures` 表达，见下一节。
 
 ### Gemini 思考签名（必须回传）
 
@@ -249,6 +274,55 @@ if (result.tool_calls?.length) {
 - 其他协议（OpenAI 兼容、Anthropic）不产生也不需要这个字段，传了会被忽略。
 - 调用方如果只存 `text` 和 `tool_calls` 而不存签名，Gemini 多轮工具调用会失败——这是接入 Gemini 时最容易漏的一步。
 
+### Anthropic 思考签名（同样必须回传）
+
+Anthropic 的 extended thinking 有一个容易漏的硬约束：**开了思考之后，带 `tool_use` 的
+assistant 消息必须以 `thinking` / `redacted_thinking` block 开头**，否则第二轮直接 400：
+
+```
+messages.1.content.0.type: Expected `thinking` or `redacted_thinking`, but found `tool_use`
+```
+
+`reasoning` 只是一段拼接的纯文本，装不下签名；`redacted_thinking` 更是上游加密后的数据，
+插件只能原样搬运。所以思考 block 单独用数组表达：
+
+```ts
+interface ReasoningSignature {
+  part_index: number                                  // 回传时重建 content 数组里的下标
+  block_type: 'thinking' | 'redacted_thinking'
+  thinking?: string                                   // block_type=thinking：思考正文
+  signature?: string                                  // block_type=thinking：签名原文
+  data?: string                                       // block_type=redacted_thinking：加密数据
+}
+```
+
+`ChatResult.reasoning_signatures` 拿到的数组**原样**塞回下一轮 assistant 消息即可：
+
+```ts
+const result = await llm.chat({ model: 'claude-thinking', messages, tools })
+if (result.tool_calls?.length) {
+  messages.push({
+    role: 'assistant',
+    content: result.text,
+    reasoning_signatures: result.reasoning_signatures,  // 漏了下一轮必 400
+    tool_calls: result.tool_calls,
+  })
+  // ...执行工具，push tool 消息，再次调用
+}
+```
+
+说明：
+
+- block 回传时**自动排在 assistant `content` 的最前面**，顺序由插件保证，调用方不用管。
+- 正文与签名缺一不可：调用方没存全的残缺签名会被丢弃（发出去只会 400）。
+- 流式调用同样可用：每个 block 通过 `reasoning_signature` 事件透出，
+  `done.result.reasoning_signatures` 里是汇总后的完整数组。
+- `thinking` 的正文增量仍然通过 `reasoning_delta` 事件 / `result.reasoning` 返回，供展示。
+- 有思考时 `tool_choice` 只能是 `auto`：`required` 与指定工具都会被上游拒绝，插件会
+  **降级为 auto 并记一条 warn 日志**，不再让整轮对话 400。
+- 有思考时 `temperature` 只能是 1、`top_p` 只能是 0.95–1：不合法的值会被插件**丢弃**
+  （等价于用上游默认值 1），不会原样发出去吃 400。
+
 ### 多模态输入
 
 `content` 可以是字符串，也可以是内容片段数组：
@@ -266,12 +340,12 @@ await llm.chat({
 })
 ```
 
-| 片段 | OpenAI 兼容 | Anthropic |
-| --- | --- | --- |
-| `text` | ✅ | ✅ |
-| `image`（`url` 或 `data` + `media_type`） | ✅ | ✅ |
-| `audio`（`data` + `format`） | ✅ | ❌ 抛 `unsupported` |
-| `file`（`url` 或 `data` + `media_type`） | ❌ 抛 `unsupported` | ✅ |
+| 片段 | OpenAI 兼容 | Anthropic | Gemini |
+| --- | --- | --- | --- |
+| `text` | ✅ | ✅ | ✅ |
+| `image`（`url` 或 `data` + `media_type`） | ✅ | ✅ | ✅（图片走 `inline_data` / `file_data`） |
+| `audio`（`data` + `format`） | ✅ | ❌ 抛 `unsupported` | ✅ |
+| `file`（`url` 或 `data` + `media_type`） | ❌ 抛 `unsupported` | ✅ | ✅ |
 
 片段数组里的 `text` 片段会拼成 `ChatResult.text`，其余片段只影响请求。
 
@@ -352,6 +426,7 @@ if (result.tool_calls?.length) {
 - SSE 增量解析，限制单行缓冲。
 - 热路径只读取一次配置 KV，不写入 KV 或 D1。
 - 服务可在 handler、route、cron 中使用；Durable Object 的 `this.plugin` 不提供服务调用能力。
+- 本插件自己的命令/路由**直接构造服务实例**（`createLLM(ctx)`），不走 `ctx.service('llm')`：框架的 `ctx.service()` 只认自己 `depends` 里声明过的服务，而插件不能把自己提供的服务声明成依赖
 
 ## 本地开发
 
@@ -407,7 +482,7 @@ src/
   modelMetadata.ts      models.dev 元数据到模型配置的映射
   http.ts               JSON 响应、请求体限制、超时、脱敏
   sse.ts                SSE 增量解析
-  protocols/            OpenAI / Anthropic 适配器与注册表
+  protocols/            OpenAI / Anthropic / Gemini 适配器、思考等级翻译与注册表
   routes.ts             管理页 API
   page.generated.ts     由 build-page.mjs 生成的页面，请勿手动修改
 web/                    配置页源码（TypeScript + DOM，build-page.mjs 打成单文件）

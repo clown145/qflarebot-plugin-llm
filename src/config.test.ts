@@ -5,6 +5,7 @@ import { resolveTarget } from './config/resolve.js'
 import { mergeSecrets, toPublicConfig } from './config/secrets.js'
 import type { StoredConfig } from './config/types.js'
 import { validateConfig, isPrivateHost, checkBaseUrl, isMetadataHost } from './config/validate.js'
+import { validateChatRequest } from './request.js'
 
 function sample(): StoredConfig {
   const config = createDefaultConfig()
@@ -340,5 +341,79 @@ describe('纯 IPv6 地址（不只是 isPrivateHost，要过完整 checkBaseUrl�
     for (const url of ['http://[fd00:ec2::254]/v1', 'http://[fe80::1]/v1', 'http://[::ffff:169.254.169.254]/v1']) {
       expect(run(url, true).some((i) => i.level === 'error' && i.message.includes('元数据')), url).toBe(true)
     }
+  })
+})
+
+/**
+ * P1-3 的入参校验：`reasoning_signatures` 是调用方原样回传的数据，
+ * 形状明显不对时应该在发请求前报 bad_request，而不是静默丢掉或发出去吃上游 400。
+ */
+describe('reasoning_signatures 的形状校验', () => {
+  const base = () => ({
+    model: 'chat',
+    messages: [
+      { role: 'user' as const, content: 'x' },
+      {
+        role: 'assistant' as const,
+        content: '',
+        tool_calls: [{ id: 'c1', name: 't', arguments: '{}' }],
+      },
+    ],
+  })
+
+  it('合法的 thinking 签名通过', () => {
+    expect(() => validateChatRequest({
+      ...base(),
+      messages: [
+        { role: 'user', content: 'x' },
+        {
+          role: 'assistant',
+          reasoning_signatures: [{ part_index: 0, block_type: 'thinking', thinking: '想', signature: 'sig' }],
+          tool_calls: [{ id: 'c1', name: 't', arguments: '{}' }],
+        },
+      ],
+    })).not.toThrow()
+  })
+
+  it('redacted_thinking 需要 data', () => {
+    expect(() => validateChatRequest({
+      ...base(),
+      messages: [
+        { role: 'user', content: 'x' },
+        {
+          role: 'assistant',
+          reasoning_signatures: [{ part_index: 0, block_type: 'redacted_thinking' } as never],
+          tool_calls: [{ id: 'c1', name: 't', arguments: '{}' }],
+        },
+      ],
+    })).toThrow(/data 必填/)
+  })
+
+  it('block_type 必须是两种之一', () => {
+    expect(() => validateChatRequest({
+      ...base(),
+      messages: [
+        { role: 'user', content: 'x' },
+        {
+          role: 'assistant',
+          reasoning_signatures: [{ part_index: 0, block_type: 'other', data: 'x' } as never],
+          tool_calls: [{ id: 'c1', name: 't', arguments: '{}' }],
+        },
+      ],
+    })).toThrow(/block_type/)
+  })
+
+  it('part_index 必须是非负整数', () => {
+    expect(() => validateChatRequest({
+      ...base(),
+      messages: [
+        { role: 'user', content: 'x' },
+        {
+          role: 'assistant',
+          reasoning_signatures: [{ part_index: -1, block_type: 'thinking', thinking: '', signature: 's' }],
+          tool_calls: [{ id: 'c1', name: 't', arguments: '{}' }],
+        },
+      ],
+    })).toThrow(/part_index/)
   })
 })

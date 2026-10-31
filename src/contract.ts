@@ -61,6 +61,40 @@ export interface ThoughtSignature {
   tool_name?: string
 }
 
+/**
+ * Anthropic 思考签名（`thinking` / `redacted_thinking` block）。
+ *
+ * Anthropic 在多轮工具调用时要求**把上一轮的思考 block 原样回传**，而且必须排在
+ * assistant `content` 的最前面；缺了直接 400：
+ *
+ * ```
+ * Expected `thinking` or `redacted_thinking`, but found `tool_use`
+ * ```
+ *
+ * `reasoning` 只是把思考正文拼成的一段纯文本，装不下签名，所以另开这个数组：
+ * 一条 `thinking` block = 正文 + 签名，两者必须成对回传；`redacted_thinking`
+ * 是上游加密后的思考内容，插件只能原样保留、无法解读。
+ *
+ * 形状与 `ThoughtSignature` 同构（数组 + part 定位），其他协议不产生也不需要。
+ */
+export interface ReasoningSignature {
+  /**
+   * 该 block 在**回传时重建的 assistant `content` 数组**里的下标（0-based）。
+   *
+   * 重建顺序固定为「先推理 block（按本下标升序）、后正文 block、后 `tool_use` block」，
+   * 与 Anthropic 对 thinking block 必须打头的要求一致。
+   */
+  part_index: number
+  /** block 类型：`thinking`（正文 + 签名）/ `redacted_thinking`（加密数据） */
+  block_type: 'thinking' | 'redacted_thinking'
+  /** `block_type = 'thinking'` 时的思考正文；回传时必须与签名一起原样带上 */
+  thinking?: string
+  /** `block_type = 'thinking'` 时的签名原文，不要改动 */
+  signature?: string
+  /** `block_type = 'redacted_thinking'` 时的加密数据原文，不要改动 */
+  data?: string
+}
+
 export interface ToolCall {
   id: string
   name: string
@@ -81,8 +115,8 @@ export interface ChatMessage {
   is_error?: boolean
   /**
    * assistant 消息里的推理内容（DeepSeek reasoning_content / Anthropic thinking）。
-   * 回传不会被读取：上游 thinking 带签名无法重建（见 README「推理内容」），
-   * 该字段只作为调用方本地记录的存在，发给本服务时会被静默忽略。
+   * 只是一段展示用的纯文本，不会回传到上游；Anthropic 的思考 block 回传走
+   * `reasoning_signatures`（签名与正文必须成对，纯文本装不下签名）。
    */
   reasoning?: string
   /**
@@ -92,6 +126,12 @@ export interface ChatMessage {
    * 其他协议不产生也不需要这个字段。
    */
   thought_signatures?: ThoughtSignature[]
+  /**
+   * Anthropic 思考签名集合。调用方原样保存 `ChatResult.reasoning_signatures`，
+   * 下一轮塞回含 `tool_use` 的 assistant 消息，否则多轮工具调用必 400。
+   * 其他协议不产生也不需要这个字段。
+   */
+  reasoning_signatures?: ReasoningSignature[]
 }
 
 export type ToolChoice = 'auto' | 'none' | 'required' | { name: string }
@@ -149,6 +189,11 @@ export interface ChatResult {
    * `ChatMessage.thought_signatures` 原样回传。
    */
   thought_signatures?: ThoughtSignature[]
+  /**
+   * Anthropic 思考签名集合；需要调用方保存并在下一轮作为
+   * `ChatMessage.reasoning_signatures` 原样回传（仅在开启思考时产生）。
+   */
+  reasoning_signatures?: ReasoningSignature[]
   finish_reason?: FinishReason
   alias: string
   /** 供应商标识（配置里的 id） */
@@ -165,6 +210,8 @@ export type StreamEvent =
   | { type: 'tool_call_delta'; index: number; id?: string; name?: string; arguments_delta?: string }
   /** Gemini 思考签名；调用方收集后在下一轮作为 `thought_signatures` 回传 */
   | ({ type: 'thought_signature' } & ThoughtSignature)
+  /** Anthropic 思考签名；调用方收集后在下一轮作为 `reasoning_signatures` 回传 */
+  | ({ type: 'reasoning_signature' } & ReasoningSignature)
   | { type: 'done'; result: ChatResult }
 
 export interface ModelInfo {

@@ -1,6 +1,6 @@
 import type { Capability } from '../src/contract.js'
-import type { ModelConfig, ProtocolId, PublicConfig, PublicConfigInput, PublicProvider, PublicProviderInput } from '../src/config/types.js'
-import { CAPABILITY_VALUES } from '../src/config/types.js'
+import type { ModelConfig, ProtocolId, PublicConfig, PublicConfigInput, PublicProvider, PublicProviderInput, ReasoningEffort } from '../src/config/types.js'
+import { CAPABILITY_VALUES, REASONING_EFFORTS } from '../src/config/types.js'
 import { canReuseSecret } from '../src/config/secrets.js'
 import { DEFAULT_TIMEOUT_MS } from '../src/config/defaults.js'
 
@@ -198,6 +198,12 @@ function capabilitiesOf(value: unknown): Capability[] | undefined {
   return out
 }
 
+/** 思考等级：只接受四个合法值；其它（老文件里的脏值）丢弃，不静默变成一个不存在的等级 */
+function effortOf(value: unknown): ReasoningEffort | undefined {
+  if (typeof value !== 'string') return undefined
+  return (REASONING_EFFORTS as string[]).includes(value) ? (value as ReasoningEffort) : undefined
+}
+
 export function normalizeDraft(value: unknown): AppConfigDraft {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('配置文件必须是 JSON 对象')
   const raw = value as Record<string, unknown>
@@ -228,6 +234,10 @@ export function normalizeDraft(value: unknown): AppConfigDraft {
       ...(headers ? { headers } : {}),
       ...(timeout !== undefined ? { timeout_ms: timeout } : {}),
       enabled: typeof p['enabled'] === 'boolean' ? p['enabled'] : true,
+      // **allow_http 必须一起导入**，否则「导出 → 导入」后内网/明文 HTTP 供应商
+      // 会被服务端按默认（关）拦成 400，用户会以为配置文件坏了。
+      // toExport 一直在导出它，只是导入端过去没接。
+      ...(p['allow_http'] === true ? { allow_http: true } : {}),
     }
   })
 
@@ -238,6 +248,7 @@ export function normalizeDraft(value: unknown): AppConfigDraft {
     const contextWindow = numberOrUndefined(m['context_window'])
     const maxOutput = numberOrUndefined(m['max_output_tokens'])
     const caps = capabilitiesOf(m['capabilities'])
+    const effort = effortOf(m['reasoning_effort'])
     return {
       alias: text(m['alias']),
       provider: text(m['provider']),
@@ -247,6 +258,9 @@ export function normalizeDraft(value: unknown): AppConfigDraft {
       ...(contextWindow !== undefined ? { context_window: contextWindow } : {}),
       ...(maxOutput !== undefined ? { max_output_tokens: maxOutput } : {}),
       ...(caps ? { capabilities: caps } : {}),
+      // **reasoning_effort 同属模型的默认请求参数**：漏掉它会让「导出 → 导入」
+      // 静默丢掉思考等级（用户以为迁过去了，实际回退成「不干预」）。
+      ...(effort ? { reasoning_effort: effort } : {}),
       enabled: typeof m['enabled'] === 'boolean' ? m['enabled'] : true,
     }
   })

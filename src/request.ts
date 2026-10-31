@@ -92,6 +92,32 @@ function checkThoughtSignature(item: unknown, where: string): void {
   }
 }
 
+/**
+ * Anthropic 思考签名的形状校验：调用方原样回传，插件只确认字段没被弄坏。
+ *
+ * `thinking` 与 `redacted_thinking` 的必填字段不同：前者要正文 + 签名，
+ * 后者要加密数据。残缺的签名在适配器里会被丢弃（不会发出去吃 400），
+ * 但「形状明显不对」（缺 signature/data、类型错）应该提前报 bad_request，
+ * 别让调用方以为数据已经存好了。
+ */
+function checkReasoningSignature(item: unknown, where: string): void {
+  if (!isRecord(item)) bad(`${where} 必须是对象`)
+  if (typeof item['part_index'] !== 'number' || !Number.isInteger(item['part_index']) || item['part_index'] < 0) {
+    bad(`${where}.part_index 必须是非负整数`)
+  }
+  const blockType = item['block_type']
+  if (blockType !== 'thinking' && blockType !== 'redacted_thinking') {
+    bad(`${where}.block_type 只能是 thinking / redacted_thinking`)
+  }
+  if (blockType === 'redacted_thinking') {
+    if (typeof item['data'] !== 'string' || !item['data']) bad(`${where}.data 必填`)
+    return
+  }
+  for (const key of ['thinking', 'signature'] as const) {
+    if (item[key] !== undefined && typeof item[key] !== 'string') bad(`${where}.${key} 必须是字符串`)
+  }
+}
+
 function checkMessage(message: ChatMessage, index: number): void {
   const where = `messages[${index}]`
   if (!isRecord(message)) bad(`${where} 必须是对象`)
@@ -101,6 +127,11 @@ function checkMessage(message: ChatMessage, index: number): void {
   if (message.thought_signatures !== undefined) {
     if (!Array.isArray(message.thought_signatures)) bad(`${where}.thought_signatures 必须是数组`)
     message.thought_signatures.forEach((item, i) => checkThoughtSignature(item, `${where}.thought_signatures[${i}]`))
+  }
+  // Anthropic 思考签名：同样只校验形状
+  if (message.reasoning_signatures !== undefined) {
+    if (!Array.isArray(message.reasoning_signatures)) bad(`${where}.reasoning_signatures 必须是数组`)
+    message.reasoning_signatures.forEach((item, i) => checkReasoningSignature(item, `${where}.reasoning_signatures[${i}]`))
   }
 
   if (message.role === 'system' || message.role === 'user') {

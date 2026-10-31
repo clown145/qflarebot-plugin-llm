@@ -162,6 +162,67 @@ describe('gemini.buildChat', () => {
     })
   })
 
+  /**
+   * P1-5 回归：`tool` 消息的 content 是**内容片段数组**时，结果不能静默变空。
+   *
+   * 契约（`MessageContent`）允许调用方传 `ContentPart[]`，OpenAI 路径早就能正确处理；
+   * Gemini 路径只判断了 `typeof === 'string'`，数组直接落到 `response = {}`——
+   * 模型拿到的工具结果是空对象，不报错，只是「答非所问」。
+   */
+  it('tool 消息 content 是片段数组时取 text 片段（不能静默变 {}）', () => {
+    const built = gemini.buildChat(target, {
+      messages: [
+        { role: 'user', content: 'x' },
+        { role: 'assistant', tool_calls: [{ id: 'c1', name: 't', arguments: '{}' }] },
+        {
+          role: 'tool',
+          tool_call_id: 'c1',
+          content: [{ type: 'text', text: '{"temp":26}' }],
+        },
+      ],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.contents.at(-1).parts[0].functionResponse.response).toEqual({ temp: 26 })
+  })
+
+  it('tool 消息 content 是纯文本片段数组时包成 {result: …}', () => {
+    const built = gemini.buildChat(target, {
+      messages: [
+        { role: 'user', content: 'x' },
+        { role: 'assistant', tool_calls: [{ id: 'c1', name: 't', arguments: '{}' }] },
+        { role: 'tool', tool_call_id: 'c1', content: [{ type: 'text', text: '失败：超时' }] },
+      ],
+    }, false)
+    const body = JSON.parse(built.init.body as string)
+    expect(body.contents.at(-1).parts[0].functionResponse.response).toEqual({ result: '失败：超时' })
+  })
+
+  /**
+   * P1-6 回归：JSON Schema 里省略 `type` 是合法写法（靠 other keywords 推断），
+   * 旧实现一律写 `type: 'null'`，上游会把该参数当成「不允许有值」。
+   */
+  it('未声明 type 的属性按 properties 推断 object，不能变成 null', () => {
+    const built = gemini.buildChat(target, {
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{
+        name: 't',
+        parameters: {
+          type: 'object',
+          properties: {
+            filter: { properties: { city: { type: 'string' } }, required: ['city'] },
+            plain: { description: '没有 type 也没有其它线索' },
+            list: { items: { type: 'string' } },
+          },
+        },
+      }],
+    }, false)
+    const params = JSON.parse(built.init.body as string).tools[0].function_declarations[0].parameters
+    expect(params.properties.filter.type).toBe('object')
+    expect(params.properties.list.type).toBe('array')
+    // 完全没有线索时退化成最宽松的标量，而不是 null（null 会让参数永远缺失）
+    expect(params.properties.plain.type).not.toBe('null')
+  })
+
   it('json:true → response_mime_type；stop 转 stopSequences', () => {
     const built = gemini.buildChat(target, {
       messages: [{ role: 'user', content: 'x' }],
@@ -643,5 +704,190 @@ describe('流式 finish 识别工具调用', () => {
       'data: {"candidates":[{"content":{"parts":[{"text":"你好"}]},"finishReason":"STOP"}]}\n\n',
     ])
     expect(out.find((e) => e.type === 'finish')).toMatchObject({ reason: 'stop' })
+  })
+})
+
+/**
+ * P2-13 / P2-17 回归：`thinkingBudget` 与 `maxOutputTokens` 互相约束。
+ *
+ * 上游硬性要求 `maxOutputTokens > thinkingBudget`，否则
+ * `400 INVALID_ARGUMENT: maxOutputTokens must be greater than thinkingBudget`。
+ * 旧实现各算各的：`ping()` 用 `max_tokens: 16`、模型配了 `high` 就发 8192 → 必坏。
+ */
+describe('Gemini thinkingBudget 与 maxOutputTokens 的约束（P2-13）', () => {
+  const config = (model: string, effort: 'high' | 'low' | 'minimal', extra: Partial<Target['model']> = {}): Target => ({
+    provider: target.provider,
+    model: { alias: 'chat', provider: 'g', model, enabled: true, reasoning_effort: effort, ...extra },
+  })
+  const bodyOf = (built: { init: RequestInit }) => JSON.parse(built.init.body as string) as Record<string, any>
+
+  it('ping 级别的极小 max_tokens 会被抬到大于预算（不再必 400）', () => {
+    const body = bodyOf(gemini.buildChat(config('gemini-2.5-flash', 'high'), {
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 16,
+    }, false))
+    const generation = body.generationConfig
+    expect(generation.thinkingConfig.thinkingBudget).toBe(8192)
+    expect(generation.maxOutputTokens).toBeGreaterThan(generation.thinkingConfig.thinkingBudget)
+  })
+
+  it('调用方显式给了更大的 max_tokens 时尊重它', () => {
+    const body = bodyOf(gemini.buildChat(config('gemini-2.5-flash', 'low'), {
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 32000,
+    }, false))
+    expect(body.generationConfig.maxOutputTokens).toBe(32000)
+    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBe(1024)
+  })
+
+  it('模型的 max_output_tokens 是硬上限：预算被压回上限以内，且 maxOutputTokens 仍大于预算', () => {
+    const body = bodyOf(gemini.buildChat(config('gemini-2.5-flash', 'high', { max_output_tokens: 6000 }), {
+      messages: [{ role: 'user', content: 'x' }],
+    }, false))
+    const generation = body.generationConfig
+    expect(generation.maxOutputTokens).toBeLessThanOrEqual(6000)
+    expect(generation.maxOutputTokens).toBeGreaterThan(generation.thinkingConfig.thinkingBudget)
+  })
+
+  it('3.x 用 thinkingLevel，没有 budget，不受 maxOutputTokens 约束', () => {
+    const body = bodyOf(gemini.buildChat(config('gemini-3-pro-preview', 'high'), {
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 16,
+    }, false))
+    expect(body.generationConfig.thinkingConfig).toEqual({ thinkingLevel: 'HIGH' })
+    expect(body.generationConfig.maxOutputTokens).toBe(16)
+  })
+})
+
+/**
+ * P2-14 回归：Gemini 2.5 Pro 不接受 `thinkingBudget: 0`（只收 128–32768 或 -1）。
+ * 旧实现把 `minimal` 一律翻译成 0，于是「2.5 Pro + 很浅」直接 400 INVALID_ARGUMENT。
+ */
+describe('Gemini 2.5 Pro 不接受 thinkingBudget: 0（P2-14）', () => {
+  const bodyOf = (built: { init: RequestInit }) => JSON.parse(built.init.body as string) as Record<string, any>
+  const config = (model: string): Target => ({
+    provider: target.provider,
+    model: { alias: 'chat', provider: 'g', model, enabled: true, reasoning_effort: 'minimal' as const },
+  })
+
+  it('2.5 Pro 的 minimal 退化成最小正预算 128，而不是非法的 0', () => {
+    const body = bodyOf(gemini.buildChat(config('gemini-2.5-pro'), { messages: [{ role: 'user', content: 'x' }] }, false))
+    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBe(128)
+  })
+
+  it('2.5 Pro 的 preview 变体同样识别', () => {
+    const body = bodyOf(gemini.buildChat(config('gemini-2.5-pro-preview-06-05'), { messages: [{ role: 'user', content: 'x' }] }, false))
+    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBe(128)
+  })
+
+  it('2.5 Flash 仍然允许 0（关闭思考），不能被这条修复误伤', () => {
+    const body = bodyOf(gemini.buildChat(config('gemini-2.5-flash'), { messages: [{ role: 'user', content: 'x' }] }, false))
+    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBe(0)
+  })
+})
+
+/**
+ * P2-15 回归：流式与非流式的 `part_index` 口径必须一致。
+ *
+ * 重建顺序是「先文本 part、后 functionCall part」。thought part 的文本**不回传**
+ * （reasoning 是独立字段），所以它不能占文本 part 的下标。
+ * 旧实现流式路径对 thought part 也自增计数，导致同一条响应在流式下比非流式多 1，
+ * 签名贴错位置 → 上游 400。
+ */
+describe('thought part 不占文本 part 下标（P2-15）', () => {
+  it('非流式：thought part 后面第一个文本 part 的签名 part_index 是 0', () => {
+    const parsed = gemini.parseResponse({
+      candidates: [{
+        content: { parts: [
+          { text: '思考中', thought: true, thoughtSignature: 'sig-thought' },
+          { text: '答案', thoughtSignature: 'sig-text' },
+        ] },
+        finish_reason: 'STOP',
+      }],
+    })
+    expect(parsed.thoughtSignatures).toEqual([
+      { part_index: 0, part_kind: 'text', signature: 'sig-thought' },
+      { part_index: 0, part_kind: 'text', signature: 'sig-text' },
+    ])
+  })
+
+  it('流式与非流式对同一段响应算出相同的 part_index', async () => {
+    const nonStream = gemini.parseResponse({
+      candidates: [{
+        content: { parts: [
+          { text: '思考中', thought: true },
+          { text: '答案', thoughtSignature: 'sig-text' },
+          { function_call: { name: 'lookup', args: {}, id: 'c1' }, thoughtSignature: 'sig-call' },
+        ] },
+        finish_reason: 'STOP',
+      }],
+    })
+    const streamed = await events([
+      'data: {"candidates":[{"content":{"parts":[{"text":"思考中","thought":true},{"text":"答案","thoughtSignature":"sig-text"},{"functionCall":{"name":"lookup","args":{},"id":"c1"},"thoughtSignature":"sig-call"}]}}]}\n\n',
+    ])
+    const streamSigs = streamed
+      .filter((item) => item.type === 'thought_signature')
+      .map(({ type: _type, ...rest }) => rest)
+    expect(streamSigs).toEqual(nonStream.thoughtSignatures)
+  })
+})
+
+/**
+ * P3-19 回归：`buildListModels` 里 `['?te', '#']` 是笔误（`?te` 永远匹配不到 `?`）。
+ * base_url 带查询串时，模型列表 URL 不能把 `?key=…` 拼进路径。
+ */
+describe('buildListModels 处理 base_url 的查询串（P3-19）', () => {
+  it('base_url 带 ?key= 时切掉查询串再拼 /models', () => {
+    const built = gemini.buildListModels({
+      id: 'g',
+      name: 'G',
+      protocol: 'gemini',
+      base_url: 'https://host/v1beta?key=abc',
+      api_key: 'g-key',
+      enabled: true,
+    })
+    expect(built.url).toBe('https://host/v1beta/models')
+  })
+})
+
+/**
+ * 调用方通过 `extra_body` 自己指定 thinkingConfig 时的自洽性。
+ *
+ * Gemini 要求 `maxOutputTokens > thinkingBudget`；旧实现直接用调用方的值、
+ * 完全不管 `maxOutputTokens`，于是「调用方给大预算 + 默认 8192 输出」必 400。
+ */
+describe('extra_body 的 thinkingBudget 也要与 maxOutputTokens 自洽', () => {
+  const bodyOf = (built: { init: RequestInit }) => JSON.parse(built.init.body as string) as Record<string, any>
+
+  it('调用方给更大的预算时，maxOutputTokens 被抬到大于预算', () => {
+    const body = bodyOf(gemini.buildChat(target, {
+      messages: [{ role: 'user', content: 'x' }],
+      extra_body: { generationConfig: { thinkingConfig: { thinkingBudget: 20000 } } },
+    }, false))
+    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBe(20000)
+    expect(body.generationConfig.maxOutputTokens).toBeGreaterThan(20000)
+  })
+
+  it('模型输出上限放不下这个预算时，放弃调用方的 thinkingConfig 并告警', () => {
+    const warns: string[] = []
+    const body = bodyOf(gemini.buildChat(
+      { ...target, model: { ...target.model, max_output_tokens: 4096 } },
+      {
+        messages: [{ role: 'user', content: 'x' }],
+        extra_body: { generationConfig: { thinkingConfig: { thinkingBudget: 20000 } } },
+      },
+      false,
+      { warn: (message) => warns.push(message) },
+    ))
+    expect(body.generationConfig.thinkingConfig ?? {}).toEqual({})
+    expect(warns).toHaveLength(1)
+  })
+
+  it('调用方只改 includeThoughts、不带预算时原样透传（不能被这条修复误伤）', () => {
+    const body = bodyOf(gemini.buildChat(target, {
+      messages: [{ role: 'user', content: 'x' }],
+      extra_body: { generationConfig: { thinkingConfig: { includeThoughts: true } } },
+    }, false))
+    expect(body.generationConfig.thinkingConfig).toEqual({ includeThoughts: true })
   })
 })

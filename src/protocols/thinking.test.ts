@@ -80,12 +80,44 @@ describe('思考等级 → Anthropic 的 thinking', () => {
     expect('thinking' in body).toBe(false)
   })
 
-  it('开启思考时把 max_tokens 抬到预算的两倍，避免 budget >= max_tokens 的 400', () => {
+  it('开启思考时 max_tokens 必须严格大于预算，并给正文留出余量', () => {
     const body = bodyOf(anthropic.buildChat(target({ reasoning_effort: 'high' }, 'anthropic'), request(), false))
     const thinking = body['thinking'] as { budget_tokens: number }
     const maxTokens = body['max_tokens'] as number
     expect(maxTokens).toBeGreaterThan(thinking.budget_tokens)
-    expect(maxTokens).toBeGreaterThanOrEqual(thinking.budget_tokens * 2)
+    // 以前断言「抬到预算的两倍」——那正是把 max_tokens 抬到 16384、撞上
+    // claude-3-5-sonnet 8192 输出上限的 bug（P2-10）。契约只要求严格大于 + 有余量。
+    // 这里写死 1024（不引用实现里的常量），避免「改常量就把测试一起改绿」。
+    expect(maxTokens - thinking.budget_tokens).toBeGreaterThanOrEqual(1024)
+  })
+
+  it('模型的 max_output_tokens 是硬上限：预算 + 余量超了要压回上限以内（P2-10 回归）', () => {
+    // claude-3-5-sonnet 这类模型输出上限 8192；high 的预算 8192 必须被压到 8192-余量，
+    // 而不是像旧实现那样抬成 16384（上游直接 400）
+    const body = bodyOf(
+      anthropic.buildChat(
+        target({ reasoning_effort: 'high', max_output_tokens: 8192 }, 'anthropic'),
+        request(),
+        false,
+      ),
+    )
+    const thinking = body['thinking'] as { budget_tokens: number }
+    const maxTokens = body['max_tokens'] as number
+    expect(maxTokens).toBeLessThanOrEqual(8192)
+    expect(maxTokens).toBeGreaterThan(thinking.budget_tokens)
+    expect(thinking.budget_tokens).toBeLessThanOrEqual(8192 - 1024)
+  })
+
+  it('输出上限小到放不下思考时，宁可不开思考也不发必 400 的组合', () => {
+    const body = bodyOf(
+      anthropic.buildChat(
+        target({ reasoning_effort: 'high', max_output_tokens: 1600 }, 'anthropic'),
+        request(),
+        false,
+      ),
+    )
+    expect('thinking' in body).toBe(false)
+    expect(body['max_tokens']).toBe(1600)
   })
 
   it('调用方传了更大的 max_tokens 时尊重它，只保证严格大于预算', () => {

@@ -1,4 +1,4 @@
-import type { Logger } from '@qqbot/sdk'
+import type { Logger, PluginContext } from '@qqbot/sdk'
 import type {
   ChatRequest,
   ChatResult,
@@ -6,6 +6,7 @@ import type {
   LLMService,
   ModelInfo,
   PingResult,
+  ReasoningSignature,
   ResolvedModel,
   StreamEvent,
   ThoughtSignature,
@@ -23,9 +24,12 @@ import type { BuiltRequest, ParsedResponse, ProtocolAdapter } from './protocols/
 import { validateChatRequest } from './request.js'
 import { isMetadataHost } from './config/validate.js'
 import { mapHistoryToolNames, mapRequestToolNames, mapResultToolNames, toolNameMapFor, type ToolNameMap } from './toolNames.js'
-import { CONFIG_READ_FAILED, type ConfigStore, type LoadedConfig } from './store.js'
+import { CONFIG_READ_FAILED, createConfigStore, type ConfigStore, type LoadedConfig } from './store.js'
 import { fetchJson, openStream, type TransportOptions } from './transport.js'
 import { fetchError, type UpstreamContext } from './upstream.js'
+import { urlSecrets } from './http.js'
+import { isRecord } from './json.js'
+import * as thinking from './protocols/thinking.js'
 
 const streamEncoder = new TextEncoder()
 
@@ -33,6 +37,18 @@ export interface LLMOptions {
   store: ConfigStore
   logger: Logger
   fetch?: typeof fetch
+}
+
+/**
+ * 用插件的 KV 与 logger 构造服务实例。
+ *
+ * 命令层、路由层和 `services` 工厂共用这一处，不要再写成 `ctx.service<LLM>('llm')`：
+ * 本插件没有（也不该）在 `depends` 里声明自己提供的服务，框架的 `ctx.service()`
+ * 对未声明的服务是**硬拒绝**（`插件 llm 没有在 depends 中声明服务 llm`），
+ * 命令在真实运行时 100% 不可用，而单测里手工注入 services 会把这个问题完全盖住。
+ */
+export function createLLM(ctx: Pick<PluginContext, 'kv' | 'logger'>): LLM {
+  return new LLM({ store: createConfigStore(ctx), logger: ctx.logger })
 }
 
 interface Prepared {
@@ -142,6 +158,8 @@ export class LLM implements LLMService {
     let reasoning = ''
     /** Gemini 思考签名集合（文本与工具调用 part）；调用方要保存并在下一轮回传 */
     const thoughtSignatures: ThoughtSignature[] = []
+    /** Anthropic 思考签名集合（thinking / redacted_thinking）；多轮工具调用必须回传 */
+    const reasoningSignatures: ReasoningSignature[] = []
     const calls: (ToolCall | undefined)[] = []
     let usage: Usage | undefined
     let finishReason: FinishReason | undefined
@@ -160,11 +178,14 @@ export class LLM implements LLMService {
 
     try {
       // 把凭据传给适配器：流内 error 事件的 message 需要脱敏。
-      // 自定义请求头里可能放凭据（如 Azure 的 api-key），与非流式路径的 upstreamContext 同标准
-      const headerSecrets = Object.values(prepared.provider.headers ?? {}).filter((value): value is string => typeof value === 'string' && value.length > 0)
+      // 自定义请求头里可能放凭据（如 Azure 的 api-key），base_url 的查询串也可能带 key；
+      // 与非流式路径的 upstreamContext 同标准（见 private upstreamContext）
+      const headerSecrets = Object.values(prepared.provider.headers ?? {})
+        .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      const streamSecrets = [...headerSecrets, ...urlSecrets(prepared.provider.base_url)]
       for await (const event of prepared.adapter.parseStream(body, {
         ...(prepared.provider.api_key ? { apiKey: prepared.provider.api_key } : {}),
-        ...(headerSecrets.length ? { secrets: headerSecrets } : {}),
+        ...(streamSecrets.length ? { secrets: streamSecrets } : {}),
       })) {
         if (event.type === 'text_delta') {
           count(event.text)
@@ -210,6 +231,13 @@ export class LLM implements LLMService {
               : { ...signature, tool_name: prepared.toolNames.toInternal(signature.tool_name) }
           thoughtSignatures.push(mappedSignature)
           yield { type: 'thought_signature', ...mappedSignature }
+        } else if (event.type === 'reasoning_signature') {
+          const { type: _type, ...signature } = event
+          count(signature.thinking)
+          count(signature.signature)
+          count(signature.data)
+          reasoningSignatures.push(signature)
+          yield { type: 'reasoning_signature', ...signature }
         } else if (event.type === 'usage') {
           usage = mergeUsage(usage, event.usage)
         } else if (event.type === 'finish') {
@@ -263,6 +291,7 @@ export class LLM implements LLMService {
         text,
         ...(reasoning ? { reasoning } : {}),
         ...(thoughtSignatures.length ? { thoughtSignatures } : {}),
+        ...(reasoningSignatures.length ? { reasoningSignatures } : {}),
         ...(toolCalls.length ? { toolCalls } : {}),
         ...(finishReason ? { finishReason } : {}),
         ...(usage ? { usage } : {}),
@@ -290,11 +319,37 @@ export class LLM implements LLMService {
       const configured = target.provider.timeout_ms ?? config.request_timeout_ms
       // 健康检查只需要极小的一次往返；上限再收一档，别让它吃掉事件预算
       const timeout = Math.min(configured, 10000)
+      // **ping 的极小请求体也要服从思考字段的硬约束。**
+      //
+      // 过去这里硬编码 `max_tokens: 16` + `temperature: 0`：
+      // - Anthropic 开了思考时，`budget_tokens`（≥1024）必须严格小于 `max_tokens`，
+      //   16 直接 400「max_tokens must be greater than budget_tokens」；
+      //   而且思考开启时 `temperature` 只能是 1，0 同样 400。
+      // - Gemini 2.5 的 `maxOutputTokens` 必须大于 `thinkingBudget`，16 < 8192 也 400。
+      //
+      // 所以先按与 chat 完全相同的规则算出合法的输出上限，再决定要不要带 temperature。
+      const effort = thinking.effectiveEffort({}, target.model)
+      const anthropicPlan = target.provider.protocol === 'anthropic'
+        ? thinking.planAnthropicOutput({ effort, requestedMaxTokens: 16, outputCap: target.model.max_output_tokens })
+        : undefined
+      const geminiPlan = target.provider.protocol === 'gemini'
+        ? thinking.planGeminiOutput({
+            effort,
+            model: target.model.model,
+            requestedMaxTokens: 16,
+            outputCap: target.model.max_output_tokens,
+          })
+        : undefined
+      const maxTokens = anthropicPlan?.maxTokens ?? geminiPlan?.maxTokens ?? 16
+      // Anthropic 开启思考时 temperature 只接受 1；干脆不发（等价于 1），
+      // 其它协议维持 0（要的是最短的一次往返，不要随机性）。
+      const thinkingOn = Boolean(anthropicPlan?.thinking)
+      const temperature = target.provider.protocol === 'anthropic' && thinkingOn ? undefined : 0
       const result = await this.chat({
         model: alias,
         messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 16,
-        temperature: 0,
+        max_tokens: maxTokens,
+        ...(temperature !== undefined ? { temperature } : {}),
         timeout_ms: timeout,
       })
       return {
@@ -339,6 +394,13 @@ export class LLM implements LLMService {
    *
    * 只改 `default_model`，不动供应商与模型列表。
    *
+   * **写前必须用 compareAndWrite 而不是「读-改-写」。**
+   *
+   * 命令（`/llm use`）与面板是两个独立的写者：命令先 `listModels()` 读到 version 7，
+   * 面板此时保存了一次（version 8，可能刚加了一个模型），命令再 `write()` 就把它
+   * 整份覆盖掉——用户会看到「面板上刚加的模型被吃了」。
+   * `compareAndWrite` 在写前再读一次版本，不一致就报可读错误，让用户重试。
+   *
    * **写后必须清掉配置缓存**：`load()` 用 `configPromise` 缓存了一次读，
    * 不清的话本次请求后续的 `chat()` 还会用旧配置 —— 用户切了模型却感觉没生效。
    */
@@ -350,9 +412,17 @@ export class LLM implements LLMService {
     }
 
     const next = withDefaultModel(config, alias)
-    await this.store.write(next)
-    // 缓存失效：下次 load() 重新读
+    // store 的 compareAndWrite 在「写前再读一次」发现版本变了时返回 conflict；
+    // 测试替身/老 store 没有实现时退回直接写（read 与 write 都保证存在）
+    const outcome = this.store.compareAndWrite
+      ? await this.store.compareAndWrite(next, config.version)
+      : (await this.store.write(next), 'written' as const)
+    // 无论成功失败都让缓存失效：冲突后也要读到最新配置，否则用户的重试会再冲突一次
     this.configPromise = undefined
+    if (outcome === 'read-failed') throw new LLMError('config', CONFIG_READ_FAILED)
+    if (outcome === 'conflict') {
+      throw new LLMError('config', '配置刚被别处修改，请重试 /llm use（面板刷新后再试更稳妥）')
+    }
   }
 
   private load(): Promise<LoadedConfig> {
@@ -430,14 +500,17 @@ export class LLM implements LLMService {
   }
 
   private upstreamContext(prepared: Prepared): UpstreamContext {
-    // 自定义请求头里可能放凭据（如 Azure 的 api-key）；一并加入脱敏列表，避免上游回显时泄漏
+    // 自定义请求头里可能放凭据（如 Azure 的 api-key）；一并加入脱敏列表，避免上游回显时泄漏。
+    // base_url 的查询串/片段同样可能带 key（自建网关的 `?key=…`），也收进来——
+    // 网络错误的 message 常带整条 URL（见 upstream.ts 的 fetchError）。
     const headerSecrets = Object.entries(prepared.provider.headers ?? {}).map(([, value]) => value).filter((v): v is string => typeof v === 'string' && v.length > 0)
+    const secrets = [...headerSecrets, ...urlSecrets(prepared.provider.base_url)]
     return {
       provider: prepared.provider.id,
       alias: prepared.model.alias,
       timeoutMs: prepared.timeoutMs,
       ...(prepared.provider.api_key ? { apiKey: prepared.provider.api_key } : {}),
-      ...(headerSecrets.length ? { secrets: headerSecrets } : {}),
+      ...(secrets.length ? { secrets } : {}),
     }
   }
 
@@ -463,7 +536,10 @@ export class LLM implements LLMService {
       // 发出去的名字必须是 wire 名：tools 列表、tool_choice、以及历史里回填的 tool_calls。
       // 三者都用同一个映射，保证「这一轮发的名字」与「上一轮回填的名字」对得上。
       const wireRequest = mapHistoryToolNames(mapRequestToolNames(prepared.request, prepared.toolNames), prepared.toolNames)
-      return prepared.adapter.buildChat({ provider: prepared.provider, model: prepared.model }, wireRequest, stream)
+      return prepared.adapter.buildChat({ provider: prepared.provider, model: prepared.model }, wireRequest, stream, {
+        // 适配器的结构性告警（如 Anthropic 思考下 tool_choice 被降级）落到插件日志
+        warn: (message, data) => this.logger.warn('llm.request', { message, ...(isRecord(data) ? data : { data }) }),
+      })
     } catch (err) {
       if (err instanceof LLMError) throw err
       throw new LLMError('bad_request', `构造上游请求失败：${errorMessage(err)}`, {
@@ -479,10 +555,12 @@ export class LLM implements LLMService {
     const mapped = mapResultToolNames(parsed.toolCalls, parsed.thoughtSignatures, prepared.toolNames)
     const toolCalls = mapped.toolCalls?.length ? mapped.toolCalls : undefined
     const finish = parsed.finishReason ?? (toolCalls ? 'tool_calls' : undefined)
+    const reasoningSignatures = parsed.reasoningSignatures?.length ? parsed.reasoningSignatures : undefined
     return {
       text: parsed.text,
       ...(parsed.reasoning ? { reasoning: parsed.reasoning } : {}),
       ...(mapped.thoughtSignatures?.length ? { thought_signatures: mapped.thoughtSignatures } : {}),
+      ...(reasoningSignatures ? { reasoning_signatures: reasoningSignatures } : {}),
       ...(toolCalls ? { tool_calls: toolCalls } : {}),
       ...(finish ? { finish_reason: finish } : {}),
       alias: prepared.model.alias,

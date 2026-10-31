@@ -438,3 +438,124 @@ describe('思考等级在服务层的装配', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 })
+
+/**
+ * P1-7 回归：网络错误消息里的 base_url 查询串密钥。
+ *
+ * `fetchError` 过去 stderr 只按 apiKey + 自定义头的**值**做精确替换，不含 base_url 的
+ * 查询串/片段。把 key 放在地址里的自建网关（`?key=…`）一旦连不上，整条 URL 会进
+ * 错误消息与日志，密钥裸露。
+ */
+describe('网络错误不泄漏 base_url 里的密钥（P1-7）', () => {
+  function configWithQueryKey(): StoredConfig {
+    const value = createDefaultConfig()
+    value.providers = [{
+      id: 'p',
+      name: 'P',
+      protocol: 'openai',
+      base_url: 'https://gw.test/v1?key=query-secret-abcdef012345',
+      api_key: 'sk-declared',
+      enabled: true,
+    }]
+    value.models = [{ alias: 'chat', provider: 'p', model: 'm', enabled: true }]
+    value.default_model = 'chat'
+    value.max_retries = 0
+    return value
+  }
+
+  it('连接失败的错误消息里没有查询串密钥', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('connect failed: https://gw.test/v1?key=query-secret-abcdef012345')
+    })
+    const llm = client(fetchMock as unknown as typeof fetch, configWithQueryKey())
+    const error = await llm.chat({ model: 'chat', messages: [{ role: 'user', content: 'x' }] })
+      .catch((err: unknown) => err)
+    expect(error).toBeInstanceOf(LLMError)
+    expect(String((error as Error).message)).not.toContain('query-secret-abcdef012345')
+    expect((error as LLMError).code).toBe('network')
+  })
+
+  it('流式 error 事件里的查询串密钥同样脱敏', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([
+      'event: error\ndata: {"type":"error","error":{"type":"authentication_error","message":"bad key at https://gw.test/v1?key=query-secret-abcdef012345"}}\n\n',
+    ]))
+    const llm = client(fetchMock as unknown as typeof fetch, configWithQueryKey())
+    const error = await drain(llm.stream({ model: 'chat', messages: [{ role: 'user', content: 'x' }] }))
+      .catch((err: unknown) => err)
+    expect(String((error as Error).message)).not.toContain('query-secret-abcdef012345')
+  })
+
+  it('查询串密钥也不会出现在日志里', async () => {
+    const logs: Array<{ message: string; data: unknown }> = []
+    const logger: Logger = {
+      debug() {},
+      info() {},
+      warn(message, data) { logs.push({ message, data }) },
+      error() {},
+    }
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('connect failed: https://gw.test/v1?key=query-secret-abcdef012345')
+    })
+    const llm = new LLM({ store: fixedStore(configWithQueryKey()), logger, fetch: fetchMock as unknown as typeof fetch })
+    await llm.chat({ model: 'chat', messages: [{ role: 'user', content: 'x' }] }).catch(() => {})
+    expect(JSON.stringify(logs)).not.toContain('query-secret-abcdef012345')
+  })
+})
+
+/**
+ * P2-17 回归：`setDefaultModel` 的读-改-写会覆盖别人同时保存的改动。
+ *
+ * 命令先 `listModels()` 读到 version N，页面此时保存了一次（version N+1，可能刚加了模型），
+ * 命令再整份 `write()` 就把它冲掉。现在走 `compareAndWrite`，冲突时给可读错误。
+ */
+describe('setDefaultModel 不覆盖并发保存（P2-17）', () => {
+  function storeOf(writeSucceeds: boolean): { store: ConfigStore; writes: number[] } {
+    const value = config()
+    value.models = [
+      { alias: 'chat', provider: 'p', model: 'm', enabled: true },
+      { alias: 'fast', provider: 'p', model: 'm2', enabled: true },
+    ]
+    const writes: number[] = []
+    const store: ConfigStore = {
+      read: async () => ({ config: value, corrupt: false }),
+      write: async () => {
+        writes.push(1)
+      },
+      // 写前复查发现版本被别人改过
+      compareAndWrite: async () => (writeSucceeds ? 'written' : 'conflict'),
+    }
+    return { store, writes }
+  }
+
+  it('并发冲突时抛可读错误，而且不会整份覆盖配置', async () => {
+    const { store, writes } = storeOf(false)
+    const llm = new LLM({ store, logger })
+    await expect(llm.setDefaultModel('fast')).rejects.toMatchObject({ code: 'config' })
+    const error = await llm.setDefaultModel('fast').catch((err: unknown) => err)
+    expect(String((error as Error).message)).toContain('别处修改')
+    // 冲突路径绝不能退回直接写
+    expect(writes).toEqual([])
+  })
+
+  it('正常路径成功并清掉配置缓存', async () => {
+    const { store, writes } = storeOf(true)
+    const llm = new LLM({ store, logger })
+    await expect(llm.setDefaultModel('fast')).resolves.toBeUndefined()
+    expect(writes).toEqual([])
+  })
+
+  it('写前复查读失败时报 config 错误（不是静默成功）', async () => {
+    const value = config()
+    value.models = [
+      { alias: 'chat', provider: 'p', model: 'm', enabled: true },
+      { alias: 'fast', provider: 'p', model: 'm2', enabled: true },
+    ]
+    const store: ConfigStore = {
+      read: async () => ({ config: value, corrupt: false }),
+      write: async () => {},
+      compareAndWrite: async () => 'read-failed',
+    }
+    const llm = new LLM({ store, logger })
+    await expect(llm.setDefaultModel('fast')).rejects.toMatchObject({ code: 'config', message: CONFIG_READ_FAILED })
+  })
+})
