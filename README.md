@@ -456,6 +456,8 @@ npm run preview      # 本地预览，使用内存数据，不连接机器人
 
 `build:page` 固定了 `absWorkingDir` 且开启压缩，同一份源码在任何目录跑出的产物一致，CI 用 `git diff --exit-code` 校验。
 
+测试就近放在被测模块旁，统一使用 `*.test.ts`、Vitest 和中文场景描述。`src/` 用 Node 环境，`web/` 用 jsdom，两边分别检查类型。控件与保存流程的用例归入对应模块已有测试文件；每个用例重置配置、草稿和模拟函数，并清理 DOM、事件监听及原型替身，避免依赖执行顺序。
+
 真实机器人联调时，可临时把插件加进种子清单，需要成对的 `source` 与 `manifest` 两个 `file:` 字段（见 `apps/seed/qqbot.manifest.json`）：
 
 ```jsonc

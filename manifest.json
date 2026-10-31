@@ -1,6 +1,6 @@
 {
   "name": "llm",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "apiVersion": 1,
   "permissions": [
     "net",

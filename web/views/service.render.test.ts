@@ -83,6 +83,14 @@ vi.mock('../modelCatalog.js', () => ({ catalogProviderFor: vi.fn(() => undefined
 import { updateConfig } from '../save.js'
 import { renderService, resetServiceState } from './service.js'
 
+const initialConfig = structuredClone(mockState.config)
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  mockState.config = structuredClone(initialConfig)
+  mockState.busy = false
+})
+
 /** 等一轮微任务，让 click 里的 async 处理器跑完 */
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -172,7 +180,7 @@ describe('保存后仍能继续编辑并保存（P1-9 回归）', () => {
     expect(providers[0]?.['name']).toBe('P1-第二次')
   })
 
-  it('a later provider edit survives an in-flight save', async () => {
+  it('保存等待期间的新供应商草稿不会被已提交的旧值覆盖', async () => {
     let finish!: () => void
     vi.mocked(updateConfig).mockImplementationOnce(async (mutate) => {
       await new Promise<void>((resolve) => { finish = resolve })
@@ -238,16 +246,18 @@ describe('保存后仍能继续编辑并保存（P1-9 回归）', () => {
   })
 })
 
-
 describe('供应商连接表单', () => {
-  beforeEach(() => { resetServiceState(); document.body.replaceChildren() })
+  beforeEach(() => {
+    resetServiceState()
+    document.body.replaceChildren()
+  })
+
   it('已有连接默认折叠，修改或验证错误不会丢掉输入', async () => {
     const root = h('div')
     document.body.append(root)
     renderService(root, vi.fn())
     const connection = root.querySelector<HTMLDetailsElement>('.connection-editor')!
-    // May retain the previous user-open state; explicitly collapse to exercise error recovery.
-    connection.open = false
+    expect(connection.open).toBe(false)
     const input = nameInput(root)
     input.value = ''
     input.dispatchEvent(new Event('input'))
@@ -258,7 +268,8 @@ describe('供应商连接表单', () => {
     expect(document.activeElement).toBe(input)
     expect(input.value).toBe('')
   })
-  it('all connection controls and model switches have accessible names', () => {
+
+  it('连接控件和模型开关都有可访问名称', () => {
     const root = h('div')
     document.body.append(root)
     renderService(root, vi.fn())

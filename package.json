@@ -1,6 +1,6 @@
 {
   "name": "qflarebot-plugin-llm",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "QFlareBot 的大模型接口插件：统一管理供应商与模型别名，向其他插件导出 llm 服务（含工具调用与多模态透传）",
   "license": "MIT",
   "type": "module",
